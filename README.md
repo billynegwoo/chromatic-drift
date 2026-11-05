@@ -2,6 +2,8 @@
 
 A lens-shifting puzzle platformer made for [GitHub Game Off 2026](https://itch.io/jam/game-off-2026) (theme: **SHIFT**).
 
+**▶ [Play in your browser](https://billynegwoo.github.io/chromatic-drift/)**
+
 The world is split into three layers of light. Turn the lens and red slides one way, blue the other, while green stays put.
 
 - **Red** is ground. You are red, so red is the only thing you can stand on.
