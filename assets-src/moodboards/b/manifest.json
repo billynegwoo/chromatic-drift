@@ -1,0 +1,60 @@
+[
+  {
+    "id": "hero-b-codex",
+    "file": "hero-b-codex.png",
+    "width": 1440,
+    "height": 900,
+    "aspect": "landscape",
+    "kind": "comp",
+    "viewport": "1440x900",
+    "engineSize": {
+      "width": 1586,
+      "height": 992
+    },
+    "crop": {
+      "from": "centre",
+      "left": 0,
+      "top": 1,
+      "width": 1586,
+      "height": 991,
+      "scale": 0.9079
+    },
+    "engineFile": "hero-b-codex-engine.png",
+    "transparent": false,
+    "prompt": "Direction B, \"Title sequence\": the title screen as a 1950s cut-paper film title sequence. The whole screen is one flat saturated colour field (deep ochre). Shapes cut from black and off-white paper with slightly rough edges and a faint paper shadow: an enormous numeral 1 as a cut-paper shape filling a third of the frame height on the left; a small square runner on a long cut-paper block with parallel stripes cut into it; a jagged row of cut-paper teeth; three tall door shapes overlapping at the right; one thin paper strip as a pointer line. Bold, graphic, rhythmic, asymmetric composition with large areas of empty colour field. No gradients, no glow, no texture except paper.",
+    "preambleSha256": "4d03a9e82250e368",
+    "tool": "codex-cli built-in image_gen",
+    "engineVersion": "codex-cli 0.163.0",
+    "seconds": 54,
+    "createdAt": "2026-11-05T20:28:43.180Z"
+  },
+  {
+    "id": "hero-b-agy",
+    "file": "hero-b-agy.png",
+    "width": 1440,
+    "height": 900,
+    "aspect": "landscape",
+    "kind": "comp",
+    "viewport": "1440x900",
+    "engineSize": {
+      "width": 1264,
+      "height": 848
+    },
+    "crop": {
+      "from": "centre",
+      "left": 0,
+      "top": 29,
+      "width": 1264,
+      "height": 790,
+      "scale": 1.1392
+    },
+    "engineFile": "hero-b-agy-engine.jpg",
+    "transparent": false,
+    "prompt": "Direction B, \"Title sequence\": the title screen as a 1950s cut-paper film title sequence. The whole screen is one flat saturated colour field (deep ochre). Shapes cut from black and off-white paper with slightly rough edges and a faint paper shadow: an enormous numeral 1 as a cut-paper shape filling a third of the frame height on the left; a small square runner on a long cut-paper block with parallel stripes cut into it; a jagged row of cut-paper teeth; three tall door shapes overlapping at the right; one thin paper strip as a pointer line. Bold, graphic, rhythmic, asymmetric composition with large areas of empty colour field. No gradients, no glow, no texture except paper.",
+    "preambleSha256": "4d03a9e82250e368",
+    "tool": "antigravity-cli image-generator subagent",
+    "engineVersion": "1.5.1",
+    "seconds": 77,
+    "createdAt": "2026-11-05T20:29:06.329Z"
+  }
+]

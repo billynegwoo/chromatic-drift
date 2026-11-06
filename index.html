@@ -4,18 +4,197 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Chromatic Drift</title>
+<meta name="description" content="A lens-shifting puzzle platformer, filed as a 1950s patent and cut from paper. GitHub Game Off 2026, theme SHIFT.">
+<link rel="icon" href="data:,">
 <style>
-  html, body { margin: 0; height: 100%; background: #000; color: #ccc; font-family: ui-monospace, Menlo, Consolas, monospace; }
-  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 0 16px; box-sizing: border-box; }
-  canvas { display: block; width: min(100%, calc((100vh - 110px) * 768 / 448)); height: auto; background: #000; outline: none; }
-  #hint { font-size: 14px; max-width: 768px; text-align: center; min-height: 2.6em; line-height: 1.3; }
-  #help { font-size: 12px; opacity: .55; text-align: center; }
+  @font-face {
+    font-family: "Big Shoulders Display";
+    src: url("fonts/BigShouldersDisplay-wght600-900-sub.woff2") format("woff2");
+    font-weight: 600 900; font-display: block;
+  }
+  /* The long text (Brief sentences, claims, the cover's rules) is typed: Courier Prime, OFL, subset to Latin-1 + ′ · – —. */
+  @font-face {
+    font-family: "Courier Prime";
+    src: url("fonts/CourierPrime-Regular-sub.woff2") format("woff2");
+    font-weight: 400; font-display: block;
+  }
+  @font-face {
+    font-family: "Courier Prime";
+    src: url("fonts/CourierPrime-Bold-sub.woff2") format("woff2");
+    font-weight: 700; font-display: block;
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #e08a1e; overscroll-behavior: none; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; display: block; outline: none; }
+  #gl { pointer-events: none; display: none; }
+  html[data-gl="on"] #gl { display: block; }
+  html[data-gl="on"] #c { opacity: 0; }
+  html[data-hot="1"] #c { cursor: pointer; }
+  /* Words stay in the DOM for screen readers; the screen itself carries the drawing. */
+  .sr { position: fixed; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  /* The playtest prints its table over the sheet. */
+  html.test #hint { position: fixed; left: 8px; bottom: 8px; width: auto; height: auto; clip-path: none; white-space: normal; z-index: 2;
+    font: 13px/1.35 ui-monospace, Menlo, monospace; background: #efe6d2; color: #141210; padding: 8px 10px; max-width: 60ch; }
 </style>
 </head>
 <body>
-<canvas id="c" width="768" height="448" tabindex="0"></canvas>
-<div id="hint"></div>
-<div id="help"></div>
+<canvas id="c" width="960" height="540" tabindex="0" aria-label="Chromatic Drift, a lens-shifting puzzle platformer"></canvas>
+<canvas id="gl" aria-hidden="true"></canvas>
+<div id="hint" class="sr" aria-live="polite"></div>
+<div id="help" class="sr"></div>
+<script type="x-shader/x-fragment" id="glsl-lib">
+// Bundled from shader-skills (MIT): https://github.com/gokayfem/shader-skills
+// ---- shader-skills library: common ----
+const float TAU = 6.28318530717959;
+
+// ---- shader-skills library: hash ----
+// PCG-style 1D integer hash.
+uint pcgHash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+// 3D integer hash, three decorrelated outputs.
+uvec3 pcg3d(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return v;
+}
+// Map a uint to [0,1) using the top 24 bits, so the result can never round up to 1.0.
+float uintToUnit(uint h) { return float(h >> 8u) * (1.0 / 16777216.0); }
+vec2 uintToUnit(uvec2 h) { return vec2(h >> 8u) * (1.0 / 16777216.0); }
+vec3 uintToUnit(uvec3 h) { return vec3(h >> 8u) * (1.0 / 16777216.0); }
+vec4 uintToUnit(uvec4 h) { return vec4(h >> 8u) * (1.0 / 16777216.0); }
+// Random float in [0,1) for an integer-valued 2D input.
+float hash12(vec2 p) {
+    uvec2 q = uvec2(ivec2(floor(p)));
+    return uintToUnit(pcgHash(q.x + pcgHash(q.y)));
+}
+// Random vec3 in [0,1)^3 for an integer-valued 3D input.
+vec3 hash33(vec3 p) { return uintToUnit(pcg3d(uvec3(ivec3(floor(p))))); }
+
+// ---- shader-skills library: noise ----
+// Quintic fade 6t^5 - 15t^4 + 10t^3: C2-continuous interpolation weights for lattice noise.
+vec2 quinticFade(vec2 f) { return f * f * f * (f * (f * 6.0 - 15.0) + 10.0); }
+vec3 quinticFade(vec3 f) { return f * f * f * (f * (f * 6.0 - 15.0) + 10.0); }
+// Derivative of quinticFade: 30 t^2 (t - 1)^2.
+vec2 quinticFadeDeriv(vec2 f) { return 30.0 * f * f * (f * (f - 2.0) + 1.0); }
+vec3 quinticFadeDeriv(vec3 f) { return 30.0 * f * f * (f * (f - 2.0) + 1.0); }
+// Unit gradient for a 2D lattice point.
+vec2 latticeGradient(vec2 cell) {
+    float a = TAU * hash12(cell);
+    return vec2(cos(a), sin(a));
+}
+// 2D gradient (Perlin-style) noise with analytic derivatives. Returns vec3(value, d/dx, d/dy). Gradient noise has less grid-aligned blockiness than value noise. Prefer it for fBm.
+vec3 gradientNoiseD(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    vec2 u = quinticFade(f), du = quinticFadeDeriv(f);
+    vec2 ga = latticeGradient(i);
+    vec2 gb = latticeGradient(i + vec2(1.0, 0.0));
+    vec2 gc = latticeGradient(i + vec2(0.0, 1.0));
+    vec2 gd = latticeGradient(i + vec2(1.0, 1.0));
+    float va = dot(ga, f);
+    float vb = dot(gb, f - vec2(1.0, 0.0));
+    float vc = dot(gc, f - vec2(0.0, 1.0));
+    float vd = dot(gd, f - vec2(1.0, 1.0));
+    float k = va - vb - vc + vd;
+    float value = va + u.x * (vb - va) + u.y * (vc - va) + u.x * u.y * k;
+    vec2 deriv = ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd)
+               + du * (vec2(vb - va, vc - va) + u.yx * k);
+    return vec3(value, deriv);
+}
+// 2D gradient noise.
+float gradientNoise(vec2 p) { return gradientNoiseD(p).x; }
+// Dot product of a hashed 3D gradient with the offset to its lattice corner.
+float latticeGradDot(vec3 cell, vec3 corner, vec3 f) {
+    vec3 g = hash33(cell + corner) * 2.0 - 1.0;
+    return dot(g, f - corner);
+}
+// 3D gradient noise.
+float gradientNoise(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    vec3 u = quinticFade(f);
+    return mix(mix(mix(latticeGradDot(i, vec3(0, 0, 0), f), latticeGradDot(i, vec3(1, 0, 0), f), u.x),
+                   mix(latticeGradDot(i, vec3(0, 1, 0), f), latticeGradDot(i, vec3(1, 1, 0), f), u.x), u.y),
+               mix(mix(latticeGradDot(i, vec3(0, 0, 1), f), latticeGradDot(i, vec3(1, 0, 1), f), u.x),
+                   mix(latticeGradDot(i, vec3(0, 1, 1), f), latticeGradDot(i, vec3(1, 1, 1), f), u.x), u.y), u.z);
+}
+// 3D gradient noise with analytic derivatives. Returns vec4(value, d/dx, d/dy, d/dz); value equals gradientNoise(p). The trilinear blend is expanded as a polynomial in the fade weights, so the gradient is the same blend of the corner gradients plus the chain-rule term of the fade.
+vec4 gradientNoiseD(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    vec3 u = quinticFade(f), du = quinticFadeDeriv(f);
+    vec3 g000 = hash33(i) * 2.0 - 1.0;
+    vec3 g100 = hash33(i + vec3(1, 0, 0)) * 2.0 - 1.0;
+    vec3 g010 = hash33(i + vec3(0, 1, 0)) * 2.0 - 1.0;
+    vec3 g110 = hash33(i + vec3(1, 1, 0)) * 2.0 - 1.0;
+    vec3 g001 = hash33(i + vec3(0, 0, 1)) * 2.0 - 1.0;
+    vec3 g101 = hash33(i + vec3(1, 0, 1)) * 2.0 - 1.0;
+    vec3 g011 = hash33(i + vec3(0, 1, 1)) * 2.0 - 1.0;
+    vec3 g111 = hash33(i + vec3(1, 1, 1)) * 2.0 - 1.0;
+    float v000 = dot(g000, f);
+    float v100 = dot(g100, f - vec3(1, 0, 0));
+    float v010 = dot(g010, f - vec3(0, 1, 0));
+    float v110 = dot(g110, f - vec3(1, 1, 0));
+    float v001 = dot(g001, f - vec3(0, 0, 1));
+    float v101 = dot(g101, f - vec3(1, 0, 1));
+    float v011 = dot(g011, f - vec3(0, 1, 1));
+    float v111 = dot(g111, f - vec3(1, 1, 1));
+    // value = v000 + kx u.x + ky u.y + kz u.z + kxy u.x u.y + kyz u.y u.z + kzx u.z u.x + kxyz u.x u.y u.z
+    float kx = v100 - v000, ky = v010 - v000, kz = v001 - v000;
+    float kxy = v000 - v100 - v010 + v110;
+    float kyz = v000 - v010 - v001 + v011;
+    float kzx = v000 - v100 - v001 + v101;
+    float kxyz = -v000 + v100 + v010 - v110 + v001 - v101 - v011 + v111;
+    float value = v000 + kx * u.x + ky * u.y + kz * u.z
+                + kxy * u.x * u.y + kyz * u.y * u.z + kzx * u.z * u.x + kxyz * u.x * u.y * u.z;
+    vec3 grad = g000 + (g100 - g000) * u.x + (g010 - g000) * u.y + (g001 - g000) * u.z
+              + (g000 - g100 - g010 + g110) * u.x * u.y
+              + (g000 - g010 - g001 + g011) * u.y * u.z
+              + (g000 - g100 - g001 + g101) * u.z * u.x
+              + (-g000 + g100 + g010 - g110 + g001 - g101 - g011 + g111) * u.x * u.y * u.z
+              + du * vec3(kx + kxy * u.y + kzx * u.z + kxyz * u.y * u.z,
+                          ky + kxy * u.x + kyz * u.z + kxyz * u.x * u.z,
+                          kz + kyz * u.y + kzx * u.x + kxyz * u.x * u.y);
+    return vec4(value, grad);
+}
+const int FBM_MAX_OCTAVES = 12;
+// Fractional Brownian motion over 2D gradient noise. Each octave is rotated to hide lattice alignment. persistence 0.5 is the classic look (H = 1). Lower is smoother, higher is rougher.
+float fbm(vec2 p, int octaves, float lacunarity, float persistence) {
+    const mat2 octaveRotation = mat2(0.8, 0.6, -0.6, 0.8);
+    float sum = 0.0, amp = 1.0, norm = 0.0;
+    for (int i = 0; i < FBM_MAX_OCTAVES; i++) {
+        if (i >= octaves) break;
+        sum += amp * gradientNoise(p);
+        norm += amp;
+        amp *= persistence;
+        p = lacunarity * (octaveRotation * p) + vec2(17.13, -3.71);
+    }
+    return 1.4 * sum / norm;
+}
+// 2D fBm with the usual defaults (lacunarity 2.01 so octave peaks never re-align, persistence 0.5).
+float fbm(vec2 p, int octaves) { return fbm(p, octaves, 2.01, 0.5); }
+// fBm over 3D gradient noise.
+float fbm(vec3 p, int octaves, float lacunarity, float persistence) {
+    const mat3 octaveRotation = mat3(0.00, 0.80, 0.60,
+                                     -0.80, 0.36, -0.48,
+                                     -0.60, -0.48, 0.64);
+    float sum = 0.0, amp = 1.0, norm = 0.0;
+    for (int i = 0; i < FBM_MAX_OCTAVES; i++) {
+        if (i >= octaves) break;
+        sum += amp * gradientNoise(p);
+        norm += amp;
+        amp *= persistence;
+        p = lacunarity * (octaveRotation * p) + vec3(17.13, -3.71, 5.29);
+    }
+    return sum / norm;
+}
+</script>
 <script>
 'use strict';
 // Chromatic Drift — prototype
@@ -36,15 +215,19 @@ const W = COLS * T, H = ROWS * T, KMAX = 4, DT = 1 / 120;
 const GRAV = 1800, JUMP = 620, SPEED = 170, ACC = 2400;
 const LENS_KEY_RATE = 6, LENS_MAX_RATE = 10, ALIGN_TOL = 0.12;
 const SPIKE_UP = 1, SPIKE_DOWN = 2, BLOCK = 3;
-const SAVE_KEY = 'chromatic-drift.best';
+const SAVE_KEY = 'chromatic-drift.best', FILING_KEY = 'chromatic-drift.filing', MUTE_KEY = 'chromatic-drift.muted';
 const TEST_MODE = /[?&]test\b/.test(location.search);   // playtest visits every level; don't save that
+const ST = new Set(new URLSearchParams(location.search).getAll('__state').flatMap(v => v.split(',')));
+const FRAMES = ST.has('frames'), DEMO = /[?&]demo\b/.test(location.search), GL_OFF = ST.has('gl-off'), POST_OFF = ST.has('post-off');
 
-const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+if (TEST_MODE) document.documentElement.classList.add('test');
+const cv = document.getElementById('c'), ctx0 = cv.getContext('2d', { alpha: false });
+let ctx = ctx0;                                         // swapped to an offscreen sheet while one is pulled off
 const hintEl = document.getElementById('hint'), helpEl = document.getElementById('help');
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 // Layout-aware key labels (AZERTY shows A/E for the lens, Z to jump, etc.)
-const labels = { KeyQ: 'Q', KeyE: 'E', KeyA: 'A', KeyD: 'D', KeyW: 'W', KeyR: 'R', KeyM: 'M' };
+const labels = { KeyQ: 'Q', KeyE: 'E', KeyA: 'A', KeyD: 'D', KeyW: 'W', KeyR: 'R', KeyM: 'M', KeyS: 'S', KeyC: 'C' };
 const K = c => labels[c] || c;
 if (navigator.keyboard && navigator.keyboard.getLayoutMap) {
   navigator.keyboard.getLayoutMap().then(m => {
@@ -179,63 +362,6 @@ const LEVELS = [
   },
 ];
 
-// Layers are pre-baked once per level.
-function makeLayer(g, ch, door) {
-  const c = document.createElement('canvas'); c.width = MW * T; c.height = MH * T;
-  const x = c.getContext('2d');
-  const C = v => ch === 0 ? `rgb(${v},0,0)` : ch === 1 ? `rgb(0,${v},0)` : `rgb(0,0,${v})`;
-  for (let ty = 0; ty < MH; ty++) for (let tx = 0; tx < MW; tx++) {
-    const v = cell(g, tx, ty);
-    if (!v) continue;
-    const px = tx * T, py = ty * T, top = !cell(g, tx, ty - 1);
-    if (ch === 0) {            // red: bricks
-      x.fillStyle = C(170); x.fillRect(px, py, T, T);
-      x.fillStyle = C(70);
-      x.fillRect(px, py + T / 2 - 1, T, 2); x.fillRect(px, py + T - 2, T, 2);
-      x.fillRect(px + (ty % 2 ? 8 : 24), py, 2, T / 2); x.fillRect(px + (ty % 2 ? 24 : 8), py + T / 2, 2, T / 2);
-      if (top) { x.fillStyle = C(255); x.fillRect(px, py, T, 3); }
-    } else if (ch === 1) {     // green: spikes or hatched block
-      x.fillStyle = C(v === BLOCK ? 45 : 28); x.fillRect(px, py, T, T);
-      if (v === BLOCK) {
-        x.strokeStyle = C(170); x.lineWidth = 2;
-        x.save(); x.beginPath(); x.rect(px, py, T, T); x.clip();
-        x.beginPath(); for (let i = -T; i < T; i += 8) { x.moveTo(px + i, py + T); x.lineTo(px + i + T, py); } x.stroke();
-        x.restore();
-      } else {
-        x.fillStyle = C(230);
-        const n = 3, w = T / n, down = v === SPIKE_DOWN;
-        for (let i = 0; i < n; i++) {
-          x.beginPath();
-          if (down) { x.moveTo(px + i * w + 1, py); x.lineTo(px + i * w + w / 2, py + T - 6); x.lineTo(px + (i + 1) * w - 1, py); }
-          else      { x.moveTo(px + i * w + 1, py + T); x.lineTo(px + i * w + w / 2, py + 6); x.lineTo(px + (i + 1) * w - 1, py + T); }
-          x.closePath(); x.fill();
-        }
-      }
-    } else {                   // blue: water
-      x.fillStyle = C(110); x.fillRect(px, py, T, T);
-      x.strokeStyle = C(230); x.lineWidth = 2;
-      for (let r = 0; r < 2; r++) {
-        const yy = py + 10 + r * 14; x.beginPath();
-        for (let i = 0; i <= T; i += 4) { const w = yy + Math.sin((px + i) / 5) * 2; i ? x.lineTo(px + i, w) : x.moveTo(px + i, w); }
-        x.stroke();
-      }
-      if (top) { x.fillStyle = C(255); x.fillRect(px, py, T, 2); }
-    }
-  }
-  // this channel's third of the exit door
-  const px = (door.x + PAD) * T, py = (door.y + PAD) * T;
-  x.fillStyle = C(60); x.fillRect(px + 4, py + 4, T - 8, 2 * T - 4);
-  x.strokeStyle = C(255); x.lineWidth = 3; x.strokeRect(px + 4.5, py + 4.5, T - 9, 2 * T - 5);
-  return c;
-}
-function makeGlow(src) {
-  const c = document.createElement('canvas'); c.width = src.width; c.height = src.height;
-  const x = c.getContext('2d');
-  if (!('filter' in x)) return null;
-  x.filter = 'blur(7px)'; x.drawImage(src, 0, 0);
-  return c;
-}
-
 let li = 0, L = null, k = 0, kT = 0, p = null, state = 'title', stT = 0, deaths = 0, time = 0, runT = 0;
 let jumpBuf = 0, resistShake = 0, lastResist = -1, wheelAcc = 0, wheelT = -1, paused = false, deathAt = null;
 let wasAligned = false;
@@ -245,8 +371,8 @@ const offs = (s, kk) => [(-PAD + s * kk * L.ax) * T, (-PAD + s * kk * L.ay) * T]
 let best = 0;
 try { best = clamp(parseInt(localStorage.getItem(SAVE_KEY), 10) || 0, 0, LEVELS.length - 1); } catch (e) { best = 0; }
 function saveBest(i) {
-  if (TEST_MODE) return;
   best = Math.max(best, i);
+  if (TEST_MODE || DEMO) return;
   try { localStorage.setItem(SAVE_KEY, String(best)); } catch (e) { /* private mode: progress just isn't kept */ }
 }
 
@@ -264,7 +390,7 @@ function loadLevel(i) {
   L = { ...d, R, G, B, ax, ay, layers, glows: layers.map(makeGlow) };
   saveBest(i);
   fx.intro = 1; fx.banner = 1.8; fx.parts.length = 0;
-  resetLevel(); updateText();
+  resetLevel(); updateText(); onLoadLevel();
 }
 function resetLevel() {
   k = kT = L.k0;
@@ -273,14 +399,17 @@ function resetLevel() {
   p.y = (L.spawn.y + 1) * T - p.h;
   state = 'play'; jumpBuf = 0; deathAt = null;
   wasAligned = Math.abs(k - L.kd) < ALIGN_TOL;
-  fx.spawn = 0.35; fx.trail.length = 0; fx.kPrev = k; fx.kVel = 0;
+  fx.spawn = 0.35; fx.trail.length = 0; fx.kPrev = k; fx.kVel = 0; onReset();
 }
-function startGame(i) { deaths = 0; runT = 0; loadLevel(i); sfx('align'); }
+function startGame(i) { deaths = 0; runT = 0; loadLevel(i); }
 const levelKeys = () => LEVELS.length >= 10 ? '1–9, 0' : `1–${LEVELS.length}`;
 function updateText() {
-  hintEl.textContent = state === 'title' ? 'A lens-shifting puzzle platformer · GitHub Game Off 2026 · theme: SHIFT'
-    : state === 'end' ? 'End of the prototype. Thanks for playing!' : (L ? L.hint() : '');
-  helpEl.textContent = `${K('KeyA')}/${K('KeyD')} or ←/→ move · ${K('KeyW')}/↑/Space jump · ${K('KeyQ')}/${K('KeyE')} or wheel: lens · ${K('KeyR')} restart · ${K('KeyM')} mute · ${levelKeys()} level select · Esc title`;
+  if (TEST_MODE && window.PLAYTEST) return;              // the playtest's table owns #hint
+  hintEl.textContent = state === 'title' ? 'Chromatic Drift. A lens-shifting puzzle platformer · GitHub Game Off 2026 · theme: SHIFT. Press Space to begin.'
+    : state === 'end' ? `Letters Patent granted. ${K('KeyS')} saves the patent as an image, ${K('KeyR')} starts a new filing.`
+    : state === 'brief' ? `Brief Description of the Drawings. Press ${levelKeys()} or click a line to open a sheet, Esc to return.`
+    : (L ? `FIG. ${li + 1}, ${L.name}. ${L.hint()}` : '');
+  helpEl.textContent = `${K('KeyA')}/${K('KeyD')} or ←/→ move · ${K('KeyW')}/↑/Space jump · ${K('KeyQ')}/${K('KeyE')} or wheel: lens · ${K('KeyR')} restart · ${K('KeyM')} mute · ${levelKeys()} sheet select · Esc Brief Description of the Drawings`;
 }
 
 const redHit = (x, y, kk = k) => { const [ox, oy] = offs(-1, kk); return hits(L.R, ox, oy, x, y, p.w, p.h); };
@@ -385,352 +514,2442 @@ function update(dt) {
   }
 }
 
-// Presentation-only state. Spawned from sim events, animated on real frame time.
+
+// Direction B, "Title sequence": the patent's figures re-cut as 1950s title-card paper.
+// Everything below is presentation only. It reads the sim, never writes to it, so
+// index.html?test and this file's ?test give the same results.
+if (DEMO) best = 0;                                   // the demo always opens on FIG. 1's card
+const RM = ST.has('reduced') || ST.has('reduced-motion') || matchMedia('(prefers-reduced-motion: reduce)').matches;
+// ochre, slate, deep navy, olive (round 3: the oxblood field is retired, red paper never sits on a red-brown field)
+const INK = ['#e08a1e', '#3f5a6b', '#1e2b3a', '#6b6a2a'];
+const INK5 = '#4b2a48';                                             // the fifth ink: the grant only
+// Touch-only or tiny screens get a designed note on the cover instead of controls they can't use.
+const COARSE = matchMedia('(pointer: coarse)').matches && !matchMedia('(any-pointer: fine)').matches;
+const tooSmall = () => COARSE || innerWidth < 560 || innerHeight < 320;
+const PAPER = { black: '#141210', cream: '#efe6d2', red: '#c9372c', green: '#2f8f4e', blue: '#2c5aa8', white: '#fbf6ea' };
+const LAYER_COL = [PAPER.red, PAPER.green, PAPER.blue];
+const FONT = '"Big Shoulders Display", Impact, "Arial Narrow", sans-serif';
+const bs = (px, w = 800) => `${w} ${px}px ${FONT}`;
+// Long text is typed, like the filing's own pages: Courier Prime. Big Shoulders stays for heads, numerals, stamps.
+const TYPE = '"Courier Prime", "Courier New", Courier, monospace';
+const cp = (px, w = 400) => `${w} ${px}px ${TYPE}`;
+// Phantoms: the layer's colour darkened on the light fields (ochre, the cream Brief), lightened on the dark ones;
+// the runner's phantom in near-black / cream. These inks are never paper, so the post pass gives them no shadow.
+const PH_LIGHT = { red: '#b3271c', blue: '#1e4ba0', run: '#24201c' };
+const PH_DARK = { red: '#f0786a', blue: '#7fa6e8', run: '#f2e9d2' };
+// Final round: on slate and navy the phantoms are a 2.5 px line at full saturation (no pink tint), blue #9DBDE3.
+const PH_DEEP = { red: '#e8432f', blue: '#9dbde3', run: '#f2e9d2', w: [2.5, 2.5] };
+const lightInk = ink => ink === INK[0] || ink === PAPER.cream;
+const deepInk = ink => ink === INK[1] || ink === INK[2];
+const phInkFor = i => lightInk(INK[i % 4]) ? PH_LIGHT : deepInk(INK[i % 4]) ? PH_DEEP : PH_DARK;
+const PH_DASH = [12, 5, 2, 5], PH_DASH_RUN = [7, 3, 2, 3], PH_STRONG_W = 4, PH_FAINT_W = 3, PH_FAINT_A = 0.8;
+// Under every coloured phantom, on every field: a 1.5 px #F3EBDD keyline (1440-frame px) round each dash. Its dashes
+// are the coloured ones grown by the keyline at both ends, so the hidden line still reads dash-dot.
+const PH_KEY = '#f3ebdd', PH_KEY_W = 1.5;
+const keyDash = (dash, e) => dash.map((v, i) => i % 2 ? Math.max(0.5, v - 2 * e) : v + 2 * e);
+// A dash-dot phantom outline: the cream keyline first, then the ink on it. lw and e in the current transform's units.
+function phStroke(x, paths, ink, lw, e, dash = PH_DASH) {
+  x.lineCap = 'butt'; x.lineJoin = 'miter';
+  x.strokeStyle = PH_KEY; x.lineWidth = lw + 2 * e; x.setLineDash(keyDash(dash, e)); x.lineDashOffset = e;
+  for (const P of paths) P ? x.stroke(P) : x.stroke();
+  x.strokeStyle = ink; x.lineWidth = lw; x.setLineDash(dash); x.lineDashOffset = 0;
+  for (const P of paths) P ? x.stroke(P) : x.stroke();
+  x.setLineDash([]);
+}
+const KEYLINE = '#f2e9d2';                                           // the runner's 2 px cream keyline on dark fields
+const RED_KEY = 'rgba(20,20,20,0.6)';                                // a 2 px ink keyline (#141414 at 60%) on every red piece
+// Exit fragments (final round, FIG. 9's separation): on every field a 4 px knockout in the field's own colour, under a
+// 2 px #F4EBD4 perimeter round the fragment (1440-frame px; converted to world px when the layer is cut).
+const FRAG_EDGE = '#f4ebd4', FRAG_CLEAR = 4, FRAG_EDGE_W = 2;
+// Courier body copy is typed ink, never paper: these inks are registered with the post pass so they cast no shadow.
+// (TEXT_LIGHT lifted to #F3EBDD in the final round: the rail caption on olive needs it for 4.5:1.)
+const TEXT_DARK = '#24201c', TEXT_LIGHT = '#f3ebdd';
+// Measurements the jurors gave in px of the 1440 x 900 frame (base scale 1.5) -> drawing units at a given scale.
+const JPX = (v, unit = 1.5) => v / unit;
+// The pointer is the rostrum lamp over the cut paper (presentation only): shadows fall away from it and the cover's
+// pieces shift 2–6 px by depth. Position normalised to the viewport (-1..1), smoothed with dt; weight 0 until the
+// pointer first moves, and always 0 under reduced motion.
+const lamp = { tx: 0, ty: 0, tw: 0, x: 0, y: 0, w: 0 };
+const LAMP_RATE = 22;
+// The sheet (round 3, composed as a shot): a 104 px rail on the left (FIG. numeral, dial 20, arrows 22/24, the carry
+// state, the controls), then the figure scaled up to fill the rest of the width wall to wall (8 px margin), placed
+// vertically so its content band (the rows anything can occupy) sits as near the frame's centre as the whole world
+// allows; the rows proven free carry the sheet's title card. The world is always entirely visible.
+const OX = 152, OY = 46, CW = 960, CH = 540;              // OX/OY: the cover's and the grant's old figure origin (unused in play)
+const RAIL = 104, MR = 8, MV = 8;
+const TB = { x: 18, dialX: 52, dialY: 214, r: 32 };
+const SLIT_P = 16, SLIT_W = 5, BORDER = 6;            // stripes cut into each layer, in its hatching direction
+const PHANTOM_FAINT = 0.28, FREEZE = 6 / 60, LEADER_T = 0.4, CIRCLE_T = 0.18;
+const STAMP_HOLD = 1.25, STAMP_OUT = 0.2, STAMP_LAND = 0.11;   // ANTICIPATED: lands, stays past the respawn, peels off
+// Completion: ALLOWED holds until 0.55 s, then the sheet is lifted 6 px with a growing shadow and pulled off along
+// the sheet's lens axis (power2.in). The first handoff of a session takes its time (120 + 420 ms); after it the
+// paper is gone in 250 ms (80 + 170) and the next numeral settles in 400 ms.
+const PULL0 = 0.55, PULL_LIFT_PX = 6;
+// Final round: every sheet change moves as paper, the first and every one after: lift 120 ms (shadow 2/4 -> 12/28 px,
+// -6 px, -0.6 deg), then a 420 ms slide along the lens axis on cubic-bezier(.7,0,.2,1), the next field already under it.
+const CARD_LIFT = 0.12, CARD_SLIDE = 0.42, CARD_EASE = (() => { let f = null; return t => (f || (f = bezier(0.7, 0, 0.2, 1)))(t); })();
+const pullTimes = () => ({ lift: CARD_LIFT, slide: CARD_SLIDE });
+const SETTLE_T = 0.09, PH_IN = 0.08;                             // lens detent overshoot settle; phantoms fade in
+// The moving layer's settle offset (world px) for layer ch: runs on 2 px past the stop, then eases back.
+function settleOff(ch) {
+  if (!fx.settle || RM || !L) return [0, 0];
+  const u = clamp(fx.settle.age / SETTLE_T, 0, 1), g = u < 0.3 ? Math.sin(Math.PI / 2 * u / 0.3) : 1 - SIG((u - 0.3) / 0.7);
+  const s = (ch === 0 ? -1 : 1) * fx.settle.dir * JW(2) * g;
+  return L.ax ? [s, 0] : [0, s];
+}
+const NUM_FULL = 2.5, NUM_DIM = 0.45, NUM_FADE = 0.3;           // reference numerals: 100% for 2.5 s on a sheet's entry, then 45%
+const PH_FADE = 0.2;                                           // phantoms fade out over 200 ms once door 18 is in register
+const ESC_DROP = 0.38, ESC_LAND = 0.32, ESC_DELAY = 0.16, ESC_LIFT = 0.32, BRIEF_ROW_T0 = 0, BRIEF_STAGGER = 0.025;
+const DOOR_LIFT = 4;                                           // the door's paper stands 4 px off the sheet once it is numbered
+const GRANT_T0 = 0.5, GRANT_DT = 0.09;                         // claims typed one per beat
+const FIRST = { 10: 0, 12: 0, 18: 0, 14: 1, 16: 2 };  // a numeral appears on the sheet where its part first does
+
+// Signature curve cubic-bezier(0.32, 0.72, 0, 1) for arrivals; exits ease in (power2.in).
+function bezier(x1, y1, x2, y2) {
+  const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx, cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+  const X = u => ((ax * u + bx) * u + cx) * u, DX = u => (3 * ax * u + 2 * bx) * u + cx, Y = u => ((ay * u + by) * u + cy) * u;
+  return t => {
+    t = clamp(t, 0, 1); let u = t;
+    for (let i = 0; i < 8; i++) { const e = X(u) - t, d = DX(u); if (Math.abs(e) < 1e-6 || Math.abs(d) < 1e-6) break; u -= e / d; }
+    if (u < 0 || u > 1 || Math.abs(X(u) - t) > 1e-4) { let lo = 0, hi = 1; u = t; for (let i = 0; i < 30; i++) { if (X(u) < t) lo = u; else hi = u; u = (lo + hi) / 2; } }
+    return Y(clamp(u, 0, 1));
+  };
+}
+const SIG = bezier(0.32, 0.72, 0, 1);
+// Slam in from off-frame: arrive over 120 ms on the signature curve, overshooting 4% of the travel.
+function slam(age, dur = 0.12, over = 0.04) {
+  if (RM || age >= dur) return 1;
+  const u = clamp(age / dur, 0, 1);
+  return u < 0.72 ? (1 + over) * SIG(u / 0.72) : 1 + over * (1 - SIG((u - 0.72) / 0.28));
+}
+
+// The 2D frame is drawn at device resolution over the whole viewport; 960x540 is the safe area.
+const VIEW = { S: 1, offX: 0, offY: 0, w: CW, h: CH, cssS: 1, cssX: 0, cssY: 0 };
+function layout() {
+  const vw = Math.max(1, innerWidth), vh = Math.max(1, innerHeight);
+  const cssS = Math.min(vw / CW, vh / CH);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2, 2.5 / cssS);
+  const w = Math.round(vw * dpr), h = Math.round(vh * dpr), S = cssS * dpr;
+  const changed = Math.abs(S - VIEW.S) > 1e-6 || w !== VIEW.w || h !== VIEW.h || !cover.pieces;
+  Object.assign(VIEW, { S, w, h, cssS, offX: Math.round((w - CW * S) / 2), offY: Math.round((h - CH * S) / 2),
+    cssX: (vw - CW * cssS) / 2, cssY: (vh - CH * cssS) / 2 });
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const z0 = WP.Z;
+  placeWorld();
+  if (changed || Math.abs(WP.Z - z0) > 1e-9) { buildCover(); if (L) rebuildLayers(); }
+}
+// World placement in base units: origin (X, Y) and scale Z (world px -> base px). Presentation only.
+const WP = { X: RAIL, Y: OY, Z: 1, f: 0, band: null, vTop: 0, vBot: CH, vR: CW };
+// The visible viewport in base units, and the world's scale: the whole 768 px width between the rail and the margin.
+function placeWorld() {
+  const S = VIEW.S, vTop = -VIEW.offY / S, vBot = (VIEW.h - VIEW.offY) / S, vR = (VIEW.w - VIEW.offX) / S;
+  const availW = vR - MR - RAIL, availH = vBot - vTop - 2 * MV;
+  const Z = Math.max(0.2, Math.min(availW / W, availH / H));
+  Object.assign(WP, { Z, X: RAIL + Math.max(0, (availW - W * Z) / 2), vTop, vBot, vR });
+  placeSheet();
+}
+// Per sheet: centre the content band (rows f..13) in the frame, clamped so the whole world stays on screen.
+function placeSheet() {
+  const { Z, vTop, vBot } = WP, f = L ? (L.free || 0) : 0;
+  const lo = vTop + MV, hi = vBot - MV - H * Z, yc = (f * T + H) / 2;
+  WP.f = f;
+  WP.Y = hi < lo ? (lo + hi) / 2 : clamp((vTop + vBot) / 2 - yc * Z, lo, hi);
+  // The title band: from the top of the frame to just above the first row anything can reach (base units).
+  const top = vTop + MV + 2, bot = WP.Y + f * T * Z - 6;
+  WP.band = bot - top >= 12 ? { top, bot, x0: WP.X, x1: WP.X + W * Z } : null;
+}
+const WS = () => VIEW.S * WP.Z;                       // device px per world px
+const setBase = () => ctx.setTransform(VIEW.S, 0, 0, VIEW.S, VIEW.offX, VIEW.offY);
+const setWorld = () => ctx.setTransform(WS(), 0, 0, WS(), VIEW.offX + WP.X * VIEW.S, VIEW.offY + WP.Y * VIEW.S);
+const devX = wx => Math.round(VIEW.offX + (WP.X + wx * WP.Z) * VIEW.S), devY = wy => Math.round(VIEW.offY + (WP.Y + wy * WP.Z) * VIEW.S);
+// world <-> base units
+const w2b = (x, y) => [WP.X + x * WP.Z, WP.Y + y * WP.Z], b2w = (x, y) => [(x - WP.X) / WP.Z, (y - WP.Y) / WP.Z];
+// Jurors' 1440-frame px in world units (the world is drawn at 1.5 * Z device px per unit there).
+const JW = v => v / (1.5 * WP.Z);
+// Unrounded device px for the current transform's world/base origin (lift shadows).
+const devXf = x => { const m = ctx.getTransform(); return m.a * x + m.e; }, devYf = y => { const m = ctx.getTransform(); return m.d * y + m.f; };
+
+let mkScale = 0;                                      // the layers are cut at the world's scale, everything else at the base scale
+function mkCanvas(wl, hl) {
+  const c = document.createElement('canvas'), s = mkScale || VIEW.S;
+  c.width = Math.ceil(wl * s); c.height = Math.ceil(hl * s);
+  const x = c.getContext('2d'); x.scale(s, s);
+  return [c, x];
+}
+// Slits in the Patent Office hatching directions: red vertical, blue horizontal, green diagonal.
+function slitLines(x, dir, w, h, pitch = SLIT_P) {
+  x.beginPath();
+  if (dir === 0) for (let i = pitch / 2; i < w; i += pitch) { x.moveTo(i, -2); x.lineTo(i, h + 2); }
+  else if (dir === 2) for (let i = pitch / 2; i < h; i += pitch) { x.moveTo(-2, i); x.lineTo(w + 2, i); }
+  else for (let i = -h; i < w + h; i += pitch * 1.3) { x.moveTo(i, h + 2); x.lineTo(i + h + 4, -2); }
+  x.stroke();
+}
+// Cut slits out of everything already on (x), but not within BORDER of the edges in (edges).
+function cutSlits(x, wl, hl, fill, edges, dir, border = BORDER, pitch = SLIT_P, sw = SLIT_W) {
+  const [s, z] = mkCanvas(wl, hl);
+  z.save(); z.clip(fill); z.strokeStyle = '#000'; z.lineWidth = sw; slitLines(z, dir, wl, hl, pitch); z.restore();
+  z.globalCompositeOperation = 'destination-out'; z.strokeStyle = '#000'; z.lineWidth = border * 2; z.lineJoin = 'miter';
+  for (const e of edges) z.stroke(e);
+  x.save(); x.setTransform(1, 0, 0, 1, 0, 0); x.globalCompositeOperation = 'destination-out'; x.drawImage(s, 0, 0); x.restore();
+}
+function cutPiece(wl, hl, col, dir, opts = {}) {
+  const [c, x] = mkCanvas(wl, hl), P = new Path2D();
+  P.rect(0, 0, wl, hl);
+  x.fillStyle = col; x.fill(P);
+  if (dir !== null) cutSlits(x, wl, hl, P, [P], dir, opts.border || BORDER, opts.pitch || SLIT_P, opts.sw || SLIT_W);
+  if (col === PAPER.red) { x.strokeStyle = RED_KEY; x.lineWidth = 2; x.strokeRect(1, 1, wl - 2, hl - 2); }
+  return c;
+}
+function boundaryPath(isOn) {
+  const P = new Path2D();
+  for (let y = 0; y <= MH; y++) {
+    let run = -1;
+    for (let x = 0; x <= MW; x++) {
+      const e = x < MW && isOn(x, y) !== isOn(x, y - 1);
+      if (e && run < 0) run = x;
+      if (!e && run >= 0) { P.moveTo(run * T, y * T); P.lineTo(x * T, y * T); run = -1; }
+    }
+  }
+  for (let x = 0; x <= MW; x++) {
+    let run = -1;
+    for (let y = 0; y <= MH; y++) {
+      const e = y < MH && isOn(x, y) !== isOn(x - 1, y);
+      if (e && run < 0) run = y;
+      if (!e && run >= 0) { P.moveTo(x * T, run * T); P.lineTo(x * T, y * T); run = -1; }
+    }
+  }
+  return P;
+}
+// Teeth: two per tile, cut from the green sheet (the sim's hit box is still the whole tile).
+function teethPath(px, py, down) {
+  const P = new Path2D(), n = 2, w = T / n;
+  for (let i = 0; i < n; i++) {
+    if (down) { P.moveTo(px + i * w, py); P.lineTo(px + i * w + w / 2, py + T - 3); P.lineTo(px + (i + 1) * w, py); }
+    else      { P.moveTo(px + i * w, py + T); P.lineTo(px + i * w + w / 2, py + 3); P.lineTo(px + (i + 1) * w, py + T); }
+    P.closePath();
+  }
+  return P;
+}
+function makeLayer(g, ch, door) {
+  mkScale = WS();
+  try { return makeLayerAt(g, ch, door); } finally { mkScale = 0; }
+}
+function makeLayerAt(g, ch, door) {
+  const WL = MW * T, HL = MH * T, col = LAYER_COL[ch];
+  const [c, x] = mkCanvas(WL, HL);
+  const isRect = (tx, ty) => { const v = cell(g, tx, ty); return !!v && (ch !== 1 || v === BLOCK); };
+  const area = new Path2D(), teeth = new Path2D();
+  let cells = 0;
+  for (let ty = 0; ty < MH; ty++) for (let tx = 0; tx < MW; tx++) {
+    const v = cell(g, tx, ty);
+    if (!v) continue;
+    cells++;
+    if (isRect(tx, ty)) area.rect(tx * T, ty * T, T, T);
+    else teeth.addPath(teethPath(tx * T, ty * T, v === SPIKE_DOWN));
+  }
+  const edge = boundaryPath(isRect);
+  const dx = (door.x + PAD) * T, dy = (door.y + PAD) * T, dp = new Path2D();
+  dp.rect(dx + 4, dy + 4, T - 8, 2 * T - 4);
+  // The exit fragment is its own piece: a 4 px knockout in the field's colour around it, under a 2 px cream
+  // perimeter, on every field, so it never merges with the terrain it lies on (FIG. 9's red mass).
+  const field = INK[li % 4], fr = [dx + 4, dy + 4, T - 8, 2 * T - 4], kw = JW(FRAG_CLEAR), ew = JW(FRAG_EDGE_W);
+  const ring = (z, e) => z.fillRect(fr[0] - e, fr[1] - e, fr[2] + 2 * e, fr[3] + 2 * e);
+  const fragMount = z => {
+    z.fillStyle = field; ring(z, kw + ew);
+    z.fillStyle = FRAG_EDGE; ring(z, ew);
+    z.fillStyle = col; z.fill(dp);
+  };
+  // red pieces carry a 2 px ink keyline just inside their cut edge, on every field
+  const keyline = (z, fill, path) => { if (ch !== 0) return; z.save(); z.clip(fill); z.strokeStyle = RED_KEY; z.lineWidth = 4; z.lineJoin = 'miter'; z.stroke(path); z.restore(); };
+  // The solid version fills the band along the sheet's edge, so a part cut off by the edge of
+  // the figure still has a paper border there instead of a comb of open slits.
+  const [solid, sx] = mkCanvas(WL, HL);
+  sx.fillStyle = col; sx.fill(area); sx.fill(teeth); keyline(sx, area, edge);
+  fragMount(sx); keyline(sx, dp, dp);
+  x.fillStyle = col; x.fill(area);
+  cutSlits(x, WL, HL, area, [edge], ch, BORDER);
+  x.fillStyle = col; x.fill(teeth);
+  keyline(x, area, edge);
+  fragMount(x);
+  cutSlits(x, WL, HL, dp, [dp], ch, BORDER);
+  keyline(x, dp, dp);
+  c.solid = solid;
+  c.frag = [fr[0] - kw - ew, fr[1] - kw - ew, fr[2] + 2 * (kw + ew), fr[3] + 2 * (kw + ew)];   // its silhouette, knockout included
+  // Phantom: the same part at another lens stop, as a dash-dot hidden line in the phantom ink for this sheet's field;
+  // two weights, the stop in use (strong) and the other way (faint).
+  let ph = null, phF = null;
+  if (ch !== 1) {
+    const set = phInkFor(li), ink = set[ch === 0 ? 'red' : 'blue'];
+    const draw = lw => {
+      const [p2, y] = mkCanvas(WL, HL);
+      const pi = 4 + (ch === 2 ? 7 : 3.5), pdp = new Path2D();
+      pdp.rect(dx + pi, dy + pi, T - 2 * pi, 2 * T - pi - 1);
+      phStroke(y, [edge, teeth, pdp], ink, lw, JW(PH_KEY_W));
+      return p2;
+    };
+    // slate and navy: a fine 2.5 px line at full saturation; the other fields keep their weights
+    ph = draw(set.w ? JW(set.w[0]) : PH_STRONG_W); phF = draw(set.w ? JW(set.w[1]) : PH_FAINT_W);
+  }
+  c.ph = ph; c.phF = phF;
+  c.cells = cells;
+  c.door = [dx + T / 2, dy + 4];
+  c.tops = [];
+  for (let ty = 0; ty < MH; ty++) for (let tx = 0; tx < MW; tx++) if (cell(g, tx, ty) && !cell(g, tx, ty - 1))
+    c.tops.push([tx, ty, !cell(g, tx - 1, ty) ? -1 : !cell(g, tx + 1, ty) ? 1 : 0]);
+  return c;
+}
+function makeGlow() { return null; }
+function rebuildLayers() {
+  const d = L;
+  L.layers = [
+    makeLayer(L.R, 0, { x: d.door.x + d.kd * d.ax, y: d.door.y + d.kd * d.ay }),
+    makeLayer(L.G, 1, d.door),
+    makeLayer(L.B, 2, { x: d.door.x - d.kd * d.ax, y: d.door.y - d.kd * d.ay }),
+  ];
+}
+
+// The sim's loadLevel/resetLevel still write intro/banner/parts/trail.
 const fx = {
-  parts: [], trail: [], shake: 0, flash: 0, flashRGB: '255,255,0', squash: 0, intro: 0, banner: 0,
-  spawn: 0, gauge: 0, blink: 0, nextBlink: 2, trailT: 0, kPrev: 0, kVel: 0,
+  parts: [], trail: [], intro: 0, banner: 0, spawn: 0, kPrev: 0, kVel: 0,
+  clock: 0, alignAge: -1, dead: null, cut: null, cuts: 0, gate: 0, winAge: -1,
+  path: [], prior: [], pathT: 0, labelMemo: {}, stamp: null, lifts: [], numFull: false, endAge: -1,
+  phA: 1, sheetAge: 0, esc: null, pulled: -1,
+  pulls: 0, door: null, settle: null, kSeen: 0, phKey: '', phIn: 9, placed: [],
+  jump: null, jumpPre: -1, chipDev: null,
 };
-const motes = Array.from({ length: 45 }, () => ({
-  x: Math.random() * W, y: Math.random() * H, v: 4 + Math.random() * 10, a: 0.04 + Math.random() * 0.08, s: Math.random() < 0.3 ? 2 : 1,
-}));
-function burst(x, y, n, colors, speed, life, grav, size) {
-  for (let i = 0; i < n && fx.parts.length < 500; i++) {
-    const a = Math.random() * Math.PI * 2, s = speed * (0.3 + Math.random() * 0.7);
-    fx.parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life, c: colors[i % colors.length], g: grav, size });
-  }
+// Lens preview bookkeeping, in sim seconds so it is identical in real time and under ?__state=frames.
+const lensUI = { lastTouch: -9, dir: 1 };
+const CUTS = {
+  sheet: { slam: true, beats: [0.12, 0.20, 0.28] },   // stamp thump, numeral slams (120 ms), three typewriter beats 80 ms apart
+  title: { slam: true, beats: [0.12, 0.20, 0.28] },
+  brief: { slam: true, beats: [0.08, 0.14, 0.20] },
+  grant: { slam: true, beats: [0.12, 0.20, 0.28] },
+  fast:  { slam: false, beats: [0.0, 0.04, 0.08] },   // R / death / back from the Brief: the same cut, quick
+};
+// After the first handoff: 250 ms of paper removal (the pull) + 400 ms of the next numeral settling, of which the
+// last 100 ms is its retract while the layers drop on three quick beats.
+const QUICK_BEATS = [0.0, 0.02, 0.04], QUICK_DROP = 0.05, QUICK_RETRACT = 0.1;
+function cut(kind) {
+  fx.cuts++;
+  fx.cut = { kind, age: 0, fired: 0, go: -1 };
+  fx.gate = RM ? 0 : (fx.cuts % 2 ? 1 : -1);
 }
-const doorCenter = () => [L.door.x * T + T / 2, L.door.y * T + T];
+// FIG. numeral: full scale on the cover and through a sheet's cut, then it retracts into the title
+// block (on the first key, or after HOLD), so during play it never reads as terrain.
+const NUM_HOLD = 0.8, NUM_RETRACT = 0.42;
+function numeralRetract() {
+  const c = fx.cut;
+  if (!c || c.kind !== 'sheet') return 1;
+  if (c.quick) return RM ? 1 : SIG(c.age / QUICK_RETRACT);
+  const t0 = c.go >= 0 ? Math.min(NUM_HOLD, Math.max(c.go, 0.36)) : NUM_HOLD, a = c.age - t0;
+  if (a <= 0) return 0;
+  return RM ? 1 : SIG(a / NUM_RETRACT);
+}
+
+// What the player did, per sheet, for the claims. Presentation only: read from the sim, never written to it.
+// Sheet totals (time, deaths) run from loading the sheet; the lens counts are for the attempt that clears it.
+const PAR = [2, 7, 5, 11, 6, 7, 5, 6, 5, 6];            // lens stops in the reference solution of each sheet
+const track = { t: 0, d: 0, steps: 0, air: 0, airUp: 0, carry: 0, carryUp: 0, swim: 0 };
+let filing = new Array(LEVELS.length).fill(null);
+try { const f = JSON.parse(localStorage.getItem(FILING_KEY) || 'null'); if (Array.isArray(f) && !DEMO && !TEST_MODE) f.slice(0, LEVELS.length).forEach((c, i) => { if (c && typeof c.t === 'number') filing[i] = c; }); } catch (e) { /* no filing yet */ }
+function saveFiling() {
+  if (TEST_MODE || DEMO) return;
+  try { localStorage.setItem(FILING_KEY, JSON.stringify(filing)); } catch (e) { /* private mode */ }
+}
+// Free rows, from the level data alone (presentation only): the screen rows 0..f-1 that nothing can ever occupy.
+// A row is used if any tile of any layer (or an exit fragment, or a cord) is on screen in it at any lens stop
+// -4..+4 (the vertical sheets slide red and blue up and down, so every stop counts), or if the runner can reach it:
+// every red top on screen at any stop counts as a standing surface (conservative: reachable or not), and so does the
+// top of the water; the apex is 3.4 tiles above the runner's head there. One more row is kept as margin.
+const APEX = 3.4 * T, RUN_H = 26;
+function freeRows(d = L) {
+  let first = ROWS, reach = Infinity;
+  const on = (x, y) => x >= 0 && x < COLS && y >= 0 && y < ROWS;
+  const frags = [[0, d.door.x + d.kd * d.ax, d.door.y + d.kd * d.ay], [1, d.door.x, d.door.y], [2, d.door.x - d.kd * d.ax, d.door.y - d.kd * d.ay]];
+  for (let kk = -KMAX; kk <= KMAX; kk++) {
+    [d.R, d.G, d.B].forEach((g, ch) => {
+      const s = ch - 1, sx = s * kk * d.ax, sy = s * kk * d.ay;
+      for (let gy = 0; gy < MH; gy++) for (let gx = 0; gx < MW; gx++) {
+        const v = cell(g, gx, gy); if (!v) continue;
+        const x = gx - PAD + sx, y = gy - PAD + sy;
+        if (!on(x, y)) continue;
+        first = Math.min(first, ch === 1 && v === BLOCK && y < 4 ? 0 : y);     // a hanging block's cords run to the top
+        if ((ch === 0 || ch === 2) && !cell(g, gx, gy - 1)) reach = Math.min(reach, y * T - RUN_H - APEX);
+      }
+    });
+    for (const [ch, fx0, fy0] of frags) {
+      const s = ch - 1, x = fx0 + s * kk * d.ax, y = fy0 + s * kk * d.ay;
+      if (on(x, y) || on(x, y + 1)) first = Math.min(first, Math.max(0, y));
+    }
+  }
+  const sp = d.spawn.y + 1;                                   // the spawn's own floor, whatever it is
+  reach = Math.min(reach, sp * T - RUN_H - APEX);
+  const rr = Math.floor(reach / T) - 1;
+  return clamp(Math.min(first, rr), 0, ROWS);
+}
+function onLoadLevel() {
+  fx.prior = []; fx.labelMemo = {}; fx.stamp = null; track.t = 0; track.d = 0; fx.sheetAge = 0; fx.esc = null;
+  fx.door = null; fx.settle = null; fx.phKey = ''; fx.phIn = 9; fx.forkMemo = {};
+  if (L.free === undefined) L.free = freeRows();
+  placeSheet();
+  cut('sheet');
+  // arrived from under a pulled-off sheet: its numeral is already cut in, so it doesn't slam in again; after the
+  // first handoff of a session the next sheet settles fast (the whole handoff in 650 ms)
+  if (fx.pulled === li) { fx.cut.pre = true; if (fx.pulls++ > 0) fx.cut.quick = true; }
+  if (fx.jumpPre === li) fx.cut.pre = true;                 // jumped to: its numeral is already under the moving card
+  fx.pulled = -1; fx.jumpPre = -1;
+}
+function onReset() {
+  fx.path = []; fx.pathT = 0; fx.winAge = -1; fx.phA = 1; fx.kPrevTick = Math.round(k); cut('fast');
+  fx.kSeen = k; fx.kMoving = 0; fx.settle = null; fx.door = null;
+  Object.assign(track, { steps: 0, air: 0, airUp: 0, carry: 0, carryUp: 0, swim: 0 });
+}
+const beatsOf = () => fx.cut ? (fx.cut.quick ? QUICK_BEATS : CUTS[fx.cut.kind].beats).map(b => RM ? 0 : b) : [0, 0, 0];
+// 0 = not yet, 1 = settled. Beat i: 0 green, 1 red (+ runner), 2 blue, 3 furniture.
+function dropIn(i) {
+  if (!fx.cut || RM) return 1;
+  const q = fx.cut.quick, b = beatsOf(), t0 = i < 3 ? b[i] : b[2] + (q ? 0.01 : 0.06), a = fx.cut.age - t0;
+  return a < 0 ? 0 : Math.max(0.001, Math.min(1, a / (q ? QUICK_DROP : 0.07)));
+}
+const dropPx = u => u >= 1 ? 0 : -14 * (1 - SIG(u));
+
 const juice = {
-  jump() { fx.squash = -0.3; burst(p.x + p.w / 2, p.y + p.h, 5, ['255,40,40'], 60, 0.25, 200, 2); },
-  land(v) {
-    fx.squash = Math.min(0.45, v / 1500);
-    burst(p.x + p.w / 2, p.y + p.h, Math.round(3 + v / 90), ['255,70,70', '150,0,0'], 70, 0.35, 160, 2);
-    sfx('land', v);
+  jump() { sfx('jump'); }, land(v) { sfx('land', v); }, splash() { sfx('splash'); },
+  tick(n) {
+    sfx('click');
+    // a lens stop counts once per new whole stop reached (the snap back onto a detent is not a step);
+    // +k moves red left (x) or up (y)
+    if (n === fx.kPrevTick) return;
+    track.steps++;
+    const up = n > fx.kPrevTick; fx.kPrevTick = n;
+    if (p.wet) return;
+    if (p.grounded) { track.carry++; if (up) track.carryUp++; } else { track.air++; if (up) track.airUp++; }
   },
-  splash(into) {
-    burst(p.x + p.w / 2, p.y + (into ? p.h * 0.4 : p.h), 14, ['70,70,255', '150,150,255'], 140, 0.5, 500, 2);
-    sfx('splash');
-  },
-  tick(v) { fx.gauge = 1; sfx('tick', v); },
-  align() { const [x, y] = doorCenter(); burst(x, y, 36, ['255,255,255', '255,0,0', '0,255,0', '0,0,255'], 180, 0.8, -30, 2); sfx('align'); },
-  die() {
-    fx.shake = 0.35; fx.flash = 1; fx.flashRGB = '255,255,0';
-    burst(p.x + p.w / 2, p.y + p.h / 2, 50, ['255,255,0', '255,0,0', '0,255,0'], 260, 0.9, 400, 3);
-  },
+  align() { sfx('pin'); },
+  die() { fx.prior.push(fx.path.concat([[p.x + p.w / 2, p.y + p.h / 2 + 2]])); track.d++; sfx('rip'); },
   win() {
-    const [x, y] = doorCenter();
-    fx.flash = 0.6; fx.flashRGB = '255,255,255';
-    burst(x, y, 70, ['255,255,255', '255,0,0', '0,255,0', '0,0,255'], 320, 1.1, -60, 3);
+    fx.winAge = 0;
+    filing[li] = { t: +track.t.toFixed(2), d: track.d, steps: track.steps, air: track.air, airUp: track.airUp, carry: track.carry, carryUp: track.carryUp, swim: +track.swim.toFixed(2) };
+    saveFiling();
   },
 };
+fx.kPrevTick = 0;
+
+// Paper lifted off the sheet: a soft shadow that grows with the lift (GL), or a hard offset one (2D).
+// Rect in world px (cx, cy, half w, half h), angle, lift in world px.
+function lift(cx, cy, hw, hh, ang, l) {
+  if (l <= 0.05) return;
+  const sc = ctx.getTransform().a;                       // follows whichever transform is current (base or world)
+  if (SOFT()) { fx.lifts.push([devXf(cx), devYf(cy), hw * sc, hh * sc, ang, l * sc]); return; }
+  const prev = ctx.getTransform();
+  ctx.save(); ctx.translate(cx + l * 0.6, cy + l); ctx.rotate(ang);
+  ctx.fillStyle = 'rgba(20,18,16,0.28)'; ctx.fillRect(-hw, -hh, hw * 2, hh * 2);
+  ctx.restore(); ctx.setTransform(prev);
+}
+const SOFT = () => !!G && !POST_OFF && ctx === ctx0;
+
 function updateFx(dt) {
-  fx.shake = Math.max(0, fx.shake - dt); fx.flash = Math.max(0, fx.flash - dt * 2.5);
-  fx.gauge = Math.max(0, fx.gauge - dt * 5); fx.intro = Math.max(0, fx.intro - dt / 0.6);
-  fx.banner = Math.max(0, fx.banner - dt); fx.spawn = Math.max(0, fx.spawn - dt);
-  fx.squash *= Math.exp(-dt * 14);
-  fx.blink = Math.max(0, fx.blink - dt);
-  if ((fx.nextBlink -= dt) <= 0) { fx.blink = 0.12; fx.nextBlink = 2 + Math.random() * 3; }
-  fx.kVel += ((k - fx.kPrev) / Math.max(dt, 1e-3) - fx.kVel) * Math.min(1, dt * 20); fx.kPrev = k;
-  for (const m of motes) { m.y -= m.v * dt; if (m.y < -2) { m.y = H + 2; m.x = Math.random() * W; } }
-  if (p && L && state === 'play') {
-    if (!p.grounded && (fx.trailT -= dt) <= 0) {
-      fx.trail.push({ x: p.x, y: p.y, life: 0.22, a: Math.abs(fx.kVel) > 1 ? 0.5 : 0.16 });
-      fx.trailT = 0.03;
+  fx.clock += dt;
+  if (fx.jump) fx.jump.age += dt;
+  // the lamp follows the pointer, smoothed on the frame clock (frame-rate independent)
+  const lk = RM ? 1 : 1 - Math.exp(-dt * LAMP_RATE);
+  lamp.x += (lamp.tx - lamp.x) * lk; lamp.y += (lamp.ty - lamp.y) * lk; lamp.w += ((RM ? 0 : lamp.tw) - lamp.w) * lk;
+  if (fx.esc) { fx.esc.age += dt; if (fx.esc.age > Math.max(ESC_DROP, ESC_DELAY + ESC_LAND, ESC_LIFT) + 0.02) fx.esc = null; }
+  if (state === 'brief') {
+    if (fx.cut) {
+      const c = fx.cut; if (!c.fired) { sfx('thumpSoft'); sfx('slide'); c.fired = 1; }
+      const prev = c.age; c.age += dt;
+      // each row is stamped in on a typewriter strike, 40 ms apart
+      for (let i = 0; i < LEVELS.length; i++) { const t = RM ? 0 : BRIEF_ROW_T0 + i * BRIEF_STAGGER; if (!RM && prev < t && c.age >= t) sfx('type'); }
+      if (c.age > 1.5) fx.cut = null;
     }
-    if (p.wet && Math.random() < dt * 6) {
-      fx.parts.push({ x: p.x + p.w / 2 + (Math.random() - 0.5) * 8, y: p.y + 4, vx: 0, vy: -30, life: 0.8, max: 0.8, c: '130,130,255', g: -40, size: 2 });
-    }
-    if (Math.abs(k - L.kd) < ALIGN_TOL && Math.random() < dt * 14) {
-      fx.parts.push({ x: L.door.x * T + 4 + Math.random() * (T - 8), y: L.door.y * T + 2 * T, vx: 0, vy: -40 - Math.random() * 40, life: 1, max: 1, c: '255,255,255', g: 0, size: 2 });
-    }
-  }
-  fx.trail = fx.trail.filter(t => (t.life -= dt) > 0);
-  fx.parts = fx.parts.filter(q => {
-    q.life -= dt; q.vy += q.g * dt; q.x += q.vx * dt; q.y += q.vy * dt; q.vx *= 0.98;
-    return q.life > 0;
-  });
-}
-
-const scanTile = document.createElement('canvas'); scanTile.width = 1; scanTile.height = 3;
-scanTile.getContext('2d').fillStyle = 'rgba(0,0,0,0.16)'; scanTile.getContext('2d').fillRect(0, 2, 1, 1);
-const scanlines = ctx.createPattern(scanTile, 'repeat');
-function rr(x, y, w, h, r) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h); ctx.fill(); }
-
-function render() {
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
-  ctx.fillStyle = '#050507'; ctx.fillRect(0, 0, W, H);
-  const sh = fx.shake * 26;
-  ctx.setTransform(1, 0, 0, 1, (Math.random() - 0.5) * sh, (Math.random() - 0.5) * sh);
-  drawBackdrop();
-  if (state === 'title') drawTitle();
-  else if (state === 'end') drawEnd();
-  else {
-    drawLayers(); drawDoorFx(); drawTrail(); drawPlayer(); drawParticles();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    drawHUD();
-    if (fx.banner > 0) drawBanner();
-    if (state === 'win') splitText('ALIGNED', 44, H / 2 - 40, Math.max(0, stT - 0.7) * 30);
-  }
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.globalCompositeOperation = 'source-over';
-  if (fx.flash > 0) { ctx.fillStyle = `rgba(${fx.flashRGB},${fx.flash * 0.3})`; ctx.fillRect(0, 0, W, H); }
-  ctx.fillStyle = scanlines; ctx.fillRect(0, 0, W, H);
-  vignette();
-}
-
-function drawBackdrop() {
-  ctx.strokeStyle = 'rgba(255,255,255,0.035)'; ctx.lineWidth = 1; ctx.beginPath();
-  for (let x = 0; x <= W; x += T) { ctx.moveTo(x + .5, 0); ctx.lineTo(x + .5, H); }
-  for (let y = 0; y <= H; y += T) { ctx.moveTo(0, y + .5); ctx.lineTo(W, y + .5); }
-  ctx.stroke();
-  for (const m of motes) { ctx.fillStyle = `rgba(255,255,255,${m.a})`; ctx.fillRect(m.x, m.y, m.s, m.s); }
-}
-
-function drawLayers() {
-  const ease = fx.intro * fx.intro, spread = ease * 1.5, alpha = 1 - ease;
-  const jit = state === 'dead' ? (stT / 0.6) * 7 : 0;
-  const o = [offs(-1, k + spread), offs(0, k), offs(1, k + spread)];
-  ctx.globalCompositeOperation = 'lighter';
-  L.glows.forEach((g, i) => {
-    if (!g) return;
-    ctx.globalAlpha = alpha * (i === 1 ? 0.4 + 0.2 * Math.sin(time * 4) : 0.55);
-    ctx.drawImage(g, o[i][0], o[i][1]);
-  });
-  // motion smear on the sliding layers while the lens turns
-  if (Math.abs(fx.kVel) > 0.5) {
-    for (const [i, s] of [[0, -1], [2, 1]]) for (const [lag, a] of [[0.04, 0.28], [0.08, 0.12]]) {
-      const [gx, gy] = offs(s, k - fx.kVel * lag);
-      ctx.globalAlpha = a * alpha; ctx.drawImage(L.layers[i], gx, gy);
-    }
-  }
-  ctx.globalAlpha = alpha;
-  L.layers.forEach((c, i) => ctx.drawImage(c, o[i][0] + (Math.random() - 0.5) * jit, o[i][1] + (Math.random() - 0.5) * jit));
-  ctx.globalAlpha = 1;
-}
-
-function drawDoorFx() {
-  const d = Math.abs(k - L.kd), near = clamp(1 - d / 1.5, 0, 1), dx = L.door.x * T, dy = L.door.y * T;
-  ctx.globalCompositeOperation = 'lighter';
-  if (near > 0) { ctx.fillStyle = `rgba(255,255,255,${0.07 * near})`; ctx.fillRect(dx - 10, dy - 10, T + 20, 2 * T + 20); }
-  if (d < ALIGN_TOL || state === 'win') {
-    const beam = ctx.createLinearGradient(0, dy + 4, 0, 0);
-    beam.addColorStop(0, 'rgba(255,255,255,0.16)'); beam.addColorStop(1, 'rgba(255,255,255,0)');
-    ctx.fillStyle = beam; ctx.fillRect(dx + 6, 0, T - 12, dy + 4);
-    const grow = state === 'win' ? (1.1 - stT) * 60 : 0;
-    ctx.fillStyle = `rgba(255,255,255,${0.10 + 0.06 * Math.sin(time * 6)})`;
-    ctx.fillRect(dx - 6 - grow, dy - 6 - grow, T + 12 + grow * 2, 2 * T + 12 + grow * 2);
-  }
-}
-
-function drawTrail() {
-  ctx.globalCompositeOperation = 'lighter';
-  for (const t of fx.trail) { ctx.fillStyle = `rgba(255,0,0,${(t.life / 0.22) * t.a})`; rr(t.x, t.y, p.w, p.h, 5); }
-}
-
-function drawPlayer() {
-  if (state === 'dead') {
-    const t = 0.6 - stT;
-    ctx.globalCompositeOperation = 'lighter';
-    ctx.strokeStyle = `rgba(255,255,0,${Math.max(0, 1 - t / 0.6)})`; ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.arc(deathAt.x, deathAt.y, 6 + t * 90, 0, Math.PI * 2); ctx.stroke();
     return;
   }
-  const sq = fx.squash, w = p.w * (1 + sq * 0.7), h = p.h * (1 - sq);
-  const x = p.x + (p.w - w) / 2, y = p.y + p.h - h;
-  ctx.globalCompositeOperation = 'lighter';
-  const s = fx.spawn / 0.35;
-  if (s > 0) {                       // materialize: two ghosts converge onto the spawn
-    const d = s * s * 40;
-    ctx.fillStyle = `rgba(255,0,0,${0.5 * s})`;
-    rr(x - d * L.ax, y - d * L.ay, w, h, 5); rr(x + d * L.ax, y + d * L.ay, w, h, 5);
+  if (L && (state === 'play' || state === 'dead' || state === 'win')) fx.sheetAge += dt;
+  const aligned = L && (state === 'play' || state === 'win') && Math.abs(k - L.kd) < ALIGN_TOL;
+  // phantoms fade out over 200 ms once the door is in register, and come back as quickly when it leaves it
+  fx.phA = RM ? (aligned ? 0 : 1) : clamp(fx.phA + (aligned ? -dt : dt) / PH_FADE, 0, 1);
+  fx.phIn += dt;
+  // Lens step as material: when the lens comes to rest on a stop, the moving layers run on 2 px and settle back
+  // over 90 ms (ease-out-back). Read from k, never written to it; none of it under reduced motion.
+  if (L && (state === 'play' || state === 'dead' || state === 'win')) {
+    const moving = Math.abs(k - fx.kSeen) > 1e-6;
+    if (!moving && fx.kMoving && !RM && Math.abs(k - Math.round(k)) < 1e-6) fx.settle = { age: 0, dir: fx.kMoving };
+    fx.kMoving = moving ? Math.sign(k - fx.kSeen) : 0; fx.kSeen = k;
+    if (fx.settle && (fx.settle.age += dt) >= SETTLE_T) fx.settle = null;
   }
-  ctx.fillStyle = `rgba(255,0,0,${1 - s * 0.7})`;
-  rr(x, y, w, h, 5);
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.fillStyle = '#000';
-  const ex = x + w / 2 + p.face * 3, eh = fx.blink > 0 ? 1 : 6, ey = y + 7 * (h / p.h) + (6 - eh) / 2;
-  ctx.fillRect(ex - 5, ey, 3, eh); ctx.fillRect(ex + 2, ey, 3, eh);
+  const a0 = fx.alignAge;
+  fx.alignAge = aligned ? (fx.alignAge < 0 ? 0 : fx.alignAge + dt) : -1;
+  if (aligned) {
+    const a = fx.alignAge;
+    if (a0 < 0) sfx('nib');                                          // the leader starts drawing
+    if (a0 < LEADER_T && a >= LEADER_T) sfx('type');                 // 1
+    if (a0 < LEADER_T + 0.07 && a >= LEADER_T + 0.07) sfx('type');   // 8
+  }
+  if (state === 'dead') {
+    if (!fx.dead) fx.dead = { age: 0, at: contactPoint() };
+    else {
+      const prev = fx.dead.age; fx.dead.age += dt;
+      const st = RM ? FREEZE : FREEZE + CIRCLE_T;
+      if (prev < st && fx.dead.age >= st) {                           // ANTICIPATED lands, and stays a moment past the respawn
+        sfx('thump');
+        const c = fx.dead.at, arc = deathArc(), [x, y] = placeStamp(c, arc);
+        fx.stamp = { word: 'ANTICIPATED', paper: PAPER.red, ink: PAPER.white, x, y, rot: -0.07, born: fx.clock, sub: `CF. ATTEMPT ${track.d}`, arc };
+      }
+    }
+  } else fx.dead = null;
+  if (fx.stamp && fx.clock - fx.stamp.born > STAMP_HOLD + STAMP_OUT) fx.stamp = null;
+  if (fx.winAge >= 0) {
+    const w0 = fx.winAge;
+    if (w0 === 0) sfx('thump');
+    fx.winAge += dt;
+    const pt = PULL0 + pullTimes().lift;
+    if (!RM && w0 < pt && fx.winAge >= pt) sfx('pull');
+  }
+  if (state === 'end' && fx.endAge < 0) { fx.endAge = 0; cut('grant'); }
+  else if (state === 'end') {
+    const e0 = fx.endAge; fx.endAge += dt;
+    for (let i = 0; i < LEVELS.length; i++) { const t = GRANT_T0 + i * GRANT_DT; if (!RM && e0 < t && fx.endAge >= t) sfx('type'); }
+  } else fx.endAge = -1;
+  if (fx.cut) {
+    const c = fx.cut, b = beatsOf();
+    if (!c.fired) { sfx(c.kind === 'fast' ? 'thumpSoft' : 'thump'); c.fired = 1; }
+    const prev = c.age; c.age += dt;
+    if (c.kind !== 'fast') b.forEach(t => { if (prev < t && c.age >= t) sfx('type'); });
+    if (c.kind === 'sheet') { const r0 = c.retract || 0; c.retract = numeralRetract(); if (r0 === 0 && c.retract > 0) sfx('slide'); }
+    if (c.age > 1.5 && (c.kind !== 'sheet' || c.retract >= 1)) fx.cut = null;
+  }
+  if (state === 'play' && p) {
+    fx.pathT -= dt;
+    if (fx.pathT <= 0) { fx.pathT = 1 / 30; fx.path.push([p.x + p.w / 2, p.y + p.h / 2 + 2]); if (fx.path.length > 900) fx.path.shift(); }
+  }
+}
+// Centre of the overlap between the sim's hazard box (inset 4px, see update()) and green tiles.
+function contactPoint() {
+  const ins = 4, [gx, gy] = offs(0, k);
+  const bx = p.x + ins, by = p.y + ins, bw = p.w - 2 * ins, bh = p.h - ins;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let ty = Math.floor((by - gy) / T); ty <= Math.floor((by + bh - 0.01 - gy) / T); ty++)
+    for (let tx = Math.floor((bx - gx) / T); tx <= Math.floor((bx + bw - 0.01 - gx) / T); tx++) {
+      if (!cell(L.G, tx, ty)) continue;
+      const rx = tx * T + gx, ry = ty * T + gy;
+      x0 = Math.min(x0, Math.max(bx, rx)); y0 = Math.min(y0, Math.max(by, ry));
+      x1 = Math.max(x1, Math.min(bx + bw, rx + T)); y1 = Math.max(y1, Math.min(by + bh, ry + T));
+    }
+  if (x0 === Infinity) return { x: p.x + p.w / 2, y: H - 2, fell: true };
+  return { x: (x0 + x1) / 2, y: (y0 + y1) / 2, fell: false };
 }
 
-function drawParticles() {
-  ctx.globalCompositeOperation = 'lighter';
-  for (const q of fx.parts) { ctx.fillStyle = `rgba(${q.c},${q.life / q.max})`; ctx.fillRect(q.x, q.y, q.size, q.size); }
+// Phantoms: the next stop in both directions, faint; the direction in use (or last used), strong.
+function stopToward(dir, kk = k, lo = -KMAX, hi = KMAX) {
+  const n = dir > 0 ? Math.floor(kk + 1e-4) + 1 : Math.ceil(kk - 1e-4) - 1;
+  return n < lo || n > hi ? null : n;
+}
+function phantomStops() {
+  const turning = Math.abs(kT - k) > 1e-4;
+  let dir = turning ? Math.sign(kT - k) : lensUI.dir;
+  if (stopToward(dir) === null) dir = -dir;              // at the end of the lens the only way is back
+  return { strong: stopToward(dir), faint: stopToward(-dir), dir };
 }
 
-function drawHUD() {
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.font = '12px ui-monospace, Menlo, monospace'; ctx.textBaseline = 'middle';
-  ctx.fillStyle = 'rgba(255,255,255,0.6)';
-  ctx.textAlign = 'left';  ctx.fillText(`${li + 1}/${LEVELS.length}  ${L.name}`, 12, 20);
-  ctx.textAlign = 'right'; ctx.fillText(`deaths ${deaths}`, W - 12, 20);
-  // lens gauge: where red and blue sit relative to green, drawn along the level's axis
-  const sh = resistShake > 0 ? Math.sin(time * 90) * 4 * (resistShake / 0.18) : 0, u = 14, span = KMAX * u;
-  const vert = L.ay === 1;
-  const cx = vert ? 24 + sh : W / 2 + sh, cy = vert ? H / 2 : 20;
-  const at = v => vert ? [cx, cy + v * u] : [cx + v * u, cy];
-  ctx.fillStyle = 'rgba(0,0,0,0.55)';
-  vert ? rr(cx - 11, cy - span - 11, 22, span * 2 + 22, 11) : rr(cx - span - 11, cy - 11, span * 2 + 22, 22, 11);
-  ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 1; ctx.beginPath();
-  const [a0, a1] = [at(-KMAX), at(KMAX)];
-  ctx.moveTo(a0[0] + .5, a0[1] + .5); ctx.lineTo(a1[0] + .5, a1[1] + .5);
-  for (let i = -KMAX; i <= KMAX; i++) {
-    const [tx, ty] = at(i);
-    if (vert) { ctx.moveTo(tx - 3, ty + .5); ctx.lineTo(tx + 4, ty + .5); }
-    else      { ctx.moveTo(tx + .5, ty - 3); ctx.lineTo(tx + .5, ty + 4); }
+// Label collision solver. Each label hangs off its anchor on a paper leader at least 24 px long (1440 frame), and its
+// box keeps 12 px clear of the runner, of every silhouette (terrain at the current stop and at the stops the phantoms
+// show, the exit fragments, the cords, the door and its leader, stamps, captions, the title card) and of the other
+// labels. A numeral and its primed twin within 64 px share one forked callout "10 / 10′". Candidates: 12 directions
+// x 5 leader lengths, scored; the previous frame's choice is preferred so labels don't flicker.
+// o.unit: drawing units -> 1440-frame px; o.solid(box, pad) / o.soft(box, pad): silhouettes hit (count);
+// o.green(box): the box lies on green paper (a callout is never black there).
+const LDIRS = Array.from({ length: 12 }, (_, i) => { const a = -Math.PI / 2 + i * Math.PI / 6; return [Math.cos(a), Math.sin(a)]; });
+const LEADS = [24, 34, 48, 66, 92, 124, 160, 220, 300, 400];
+const nearOn = (b, x, y) => [clamp(x, b[0], b[0] + b[2]), clamp(y, b[1], b[1] + b[3])];
+// Does the segment, less `skip` at both ends, pass through the rectangle grown by pad? (Liang-Barsky; strict interior)
+function segRect(x0, y0, x1, y1, b, pad, skip) {
+  const dx = x1 - x0, dy = y1 - y0, l = Math.hypot(dx, dy); if (l < 1e-6) return false;
+  let t0 = skip / l, t1 = 1 - skip / l; if (t0 >= t1) return false;
+  const P = [-dx, dx, -dy, dy], Q = [x0 - (b[0] - pad), b[0] + b[2] + pad - x0, y0 - (b[1] - pad), b[1] + b[3] + pad - y0];
+  for (let i = 0; i < 4; i++) {
+    if (Math.abs(P[i]) < 1e-9) { if (Q[i] <= 0) return false; continue; }
+    const r = Q[i] / P[i];
+    if (P[i] < 0) { if (r > t0) t0 = r; } else if (r < t1) t1 = r;
+    if (t0 >= t1) return false;
   }
-  ctx.stroke();
-  ctx.globalCompositeOperation = 'lighter';
-  const r = 5 + fx.gauge * 2.5;
-  [[-k, '#f00'], [0, '#0f0'], [k, '#00f']].forEach(([v, c]) => {
-    const [dx, dy] = at(v);
-    ctx.fillStyle = c; ctx.beginPath(); ctx.arc(dx, dy, r, 0, Math.PI * 2); ctx.fill();
+  return true;
+}
+// Does the polyline come within pad of the box?
+function arcNear(box, pts, pad) {
+  for (let i = 0; i < pts.length; i++) {
+    const [px, py] = pts[i];
+    if (ovl(box, [px, py, 0, 0], pad)) return true;
+    if (i && segRect(pts[i - 1][0], pts[i - 1][1], px, py, box, pad, 0)) return true;
+  }
+  return false;
+}
+// How many segments of the polyline the segment crosses.
+function arcCross(x0, y0, x1, y1, pts) {
+  let n = 0;
+  const cr = (ax, ay, bx, by, cx, cy) => (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+  for (let i = 1; i < pts.length; i++) {
+    const [px, py] = pts[i - 1], [qx, qy] = pts[i];
+    const d1 = cr(x0, y0, x1, y1, px, py), d2 = cr(x0, y0, x1, y1, qx, qy), d3 = cr(px, py, qx, qy, x0, y0), d4 = cr(px, py, qx, qy, x1, y1);
+    if (d1 * d2 < 0 && d3 * d4 < 0) n++;
+  }
+  return n;
+}
+function segHits(x0, y0, x1, y1, boxes, pad = 0, skip = 0) {
+  let hits = 0;
+  for (const b of boxes) if (segRect(x0, y0, x1, y1, b, pad, skip)) hits++;
+  return hits;
+}
+// How many samples of a leader lie on (or within pad of) a silhouette, ignoring its last `skip` units at the anchor.
+function leaderOnSolid(x0, y0, x1, y1, solid, pad, skip) {
+  const l = Math.hypot(x1 - x0, y1 - y0), n = Math.max(1, Math.ceil(l / 12));
+  let h = 0;
+  for (let i = 0; i <= n; i++) { const u = i / n; if ((1 - u) * l < skip) continue; const x = x0 + (x1 - x0) * u, y = y0 + (y1 - y0) * u; if (solid([x, y, 0, 0], pad)) h++; }
+  return Math.min(4, h);
+}
+function placeLabels(list, obstacles, bounds, o = {}) {
+  const unit = o.unit || 1.5 * WP.Z, J = v => v / unit, clr = J(12), lead = LEADS.map(J), minLead = J(24) - 0.01, NL = LEADS.length;
+  // every candidate's static cost (silhouettes, frame, its own leaders); then the most constrained label goes first
+  const cands = list.map(lb => {
+    ctx.font = bs(lb.size, 800);
+    const w = ctx.measureText(lb.txt).width + 4, h = lb.size * 0.78;
+    const an = lb.anchors || [[lb.x, lb.y]], ax = an.reduce((s, a) => s + a[0], 0) / an.length, ay = an.reduce((s, a) => s + a[1], 0) / an.length;
+    const spread = an.length > 1 ? Math.hypot(an[0][0] - an[1][0], an[0][1] - an[1][1]) / 2 : 0, cs = [];
+    // short leaders first; the long ones (to 400 px) only for a label that found no open field near its part
+    const tryLead = j => LDIRS.forEach(([dx, dy], i) => {
+      const d = lead[j];
+      // the box's centre, so that its edge is d from the anchor along (dx, dy)
+      const t = Math.min(Math.abs(dx) > 1e-6 ? w / 2 / Math.abs(dx) : 1e9, Math.abs(dy) > 1e-6 ? h / 2 / Math.abs(dy) : 1e9);
+      const cx = ax + dx * (d + t + spread), cy = ay + dy * (d + t + spread), box = [cx - w / 2, cy - h / 2, w, h];
+      let s = j * 1.6 + (dy > 0.2 ? 1.5 : 0);
+      if (lb.away) s -= 4 * (dx * lb.away[0] + dy * lb.away[1]);
+      for (const ob of obstacles) if (ovl(box, ob, clr)) s += 700;
+      if (o.stamp && ovl(box, o.stamp, J(24))) s += 3000;
+      if (o.arc && arcNear(box, o.arc, clr)) s += 700;                    // nor on the dotted arc
+      if (o.solid) s += 1500 * Math.min(4, o.solid(box, clr));            // a numeral never sits on a part
+      if (o.soft) s += 220 * Math.min(4, o.soft(box, J(6)));
+      if (box[0] < bounds[0] || box[1] < bounds[1] || box[0] + w > bounds[2] || box[1] + h > bounds[3]) s += 6000;
+      const legs = an.map(a => { const [ex, ey] = nearOn(box, a[0], a[1]); return [ex, ey, a[0], a[1]]; });
+      for (const [ex, ey, x, y] of legs) {
+        if (Math.hypot(ex - x, ey - y) < minLead) s += 1500;
+        s += 400 * segHits(ex, ey, x, y, obstacles, J(3), J(4));   // a leader never runs through the runner, a caption...
+        if (o.stamp && segRect(ex, ey, x, y, o.stamp, J(24), 0)) s += 3000;
+        if (o.arc) s += 2500 * arcCross(ex, ey, x, y, o.arc);
+        if (o.solid) s += 160 * leaderOnSolid(ex, ey, x, y, o.solid, J(2), J(8));    // ...and prefers open field to terrain
+      }
+      if (fx.labelMemo[lb.key] === i * NL + j) s -= 4;            // hysteresis: don't flip sides frame to frame
+      cs.push({ box, legs, s, id: i * NL + j });
+    });
+    let long = false;
+    const more = () => { if (long) return false; long = true; for (let j = 5; j < NL; j++) tryLead(j); return true; };
+    for (let j = 0; j < 5; j++) tryLead(j);
+    if (!cs.some(c => c.s < 100)) more();
+    return { lb, cs, more, free: cs.filter(c => c.s < 100).length };
   });
-  ctx.globalCompositeOperation = 'source-over';
-}
-
-// Text drawn three times in R, G and B, `split` px apart: white when converged.
-function splitText(s, size, y, split, alpha = 1) {
-  ctx.font = `bold ${size}px ui-monospace, Menlo, monospace`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = alpha;
-  [['#f00', -1], ['#0f0', 0], ['#00f', 1]].forEach(([c, m]) => { ctx.fillStyle = c; ctx.fillText(s, W / 2 + m * split, y); });
-  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
-}
-
-function drawBanner() {
-  const a = clamp(fx.banner / 0.6, 0, 1), split = Math.max(0, fx.banner - 1.2) * 24 + 1.5;
-  splitText(L.name, 40, H * 0.3, split, a * 0.9);
-  ctx.font = '12px ui-monospace, Menlo, monospace'; ctx.fillStyle = `rgba(255,255,255,${0.5 * a})`;
-  ctx.fillText(`${li + 1} / ${LEVELS.length}`, W / 2, H * 0.3 + 34);
-}
-
-function drawTitle() {
-  // three light discs drifting apart and back together, white where they overlap
-  ctx.globalCompositeOperation = 'lighter';
-  const d = 26 + Math.sin(time * 0.8) * 22, cx = W / 2, cy = H / 2 - 20;
-  [['rgba(255,0,0,0.45)', -Math.PI / 2], ['rgba(0,255,0,0.45)', Math.PI / 6], ['rgba(0,0,255,0.45)', Math.PI * 5 / 6]].forEach(([c, a]) => {
-    ctx.fillStyle = c; ctx.beginPath(); ctx.arc(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 78, 0, Math.PI * 2); ctx.fill();
-  });
-  ctx.globalCompositeOperation = 'source-over';
-  splitText('CHROMATIC DRIFT', 46, cy, 3 + Math.sin(time * 1.3) * 3);
-  ctx.font = '13px ui-monospace, Menlo, monospace'; ctx.textAlign = 'center';
-  ctx.fillStyle = 'rgba(255,255,255,0.75)';
-  ctx.fillText('shift the light. walk on red.', W / 2, cy + 42);
-  if (Math.sin(time * 4) > -0.4) {
-    ctx.fillStyle = 'rgba(255,255,255,0.9)';
-    ctx.fillText(best > 0 ? `press any key to continue · ${best + 1} ${LEVELS[best].name}` : 'press any key to start', W / 2, H - 92);
+  const placed = [];
+  for (const { lb, cs, more } of cands.slice().sort((a, b) => a.free - b.free)) {
+    let best = null, bScore = Infinity;
+    // the near spots all taken by the labels placed before it: reach further out before settling for a collision
+    for (let pass = 0; pass < 2; pass++) {
+    if (pass && (bScore < 1000 || !more())) break;
+    for (const c of cs) {
+      let s = c.s;
+      if (s >= bScore) continue;
+      for (const q of placed) if (ovl(c.box, q.box, clr)) s += 3000;           // labels never touch
+      for (const [ex, ey, x, y] of c.legs) s += 400 * segHits(ex, ey, x, y, placed.map(q => q.box), J(3), J(4));
+      for (const q of placed) for (const [ex, ey, x, y] of q.legs) s += 400 * segHits(ex, ey, x, y, [c.box], J(3), J(4));
+      if (s < bScore) { bScore = s; best = c; }
+    }
+    }
+    fx.labelMemo[lb.key] = best.id;
+    placed.push({ ...lb, box: best.box, legs: best.legs, score: bScore, anchors: lb.anchors || [[lb.x, lb.y]] });
   }
-  ctx.fillStyle = 'rgba(255,255,255,0.4)';
-  ctx.fillText(`or ${levelKeys()} to pick a level`, W / 2, H - 70);
+  return o.dry ? placed : drawPlaced(placed, o);
+}
+function drawPlaced(placed, o = {}) {
+  for (const q of placed) {
+    const [bx, by, w, h] = q.box;
+    if (q.al !== undefined && q.al <= 0.004) continue;
+    ctx.globalAlpha = q.al === undefined ? 1 : q.al;
+    let col = q.col;
+    if (col === PAPER.white && onNumeral(bx, by, w, h)) col = PAPER.black;
+    if (col === PAPER.black && o.green && o.green(q.box)) col = PAPER.cream;    // never black on dark green
+    ctx.fillStyle = col;
+    for (const [ex, ey, x, y] of q.legs) if (Math.hypot(ex - x, ey - y) > 4) strip(ex, ey, x, y, 3.2, 0.8);    // leader: a thin paper strip
+    ctx.font = bs(q.size, 800); ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(q.txt, bx + w / 2, by + h);
+  }
+  ctx.globalAlpha = 1;
+  if (o.audit) fx.placed = placed;
+  return placed;
+}
+const ovl = (a, b, pad) => a[0] < b[0] + b[2] + pad && a[0] + a[2] + pad > b[0] && a[1] < b[1] + b[3] + pad && a[1] + a[3] + pad > b[1];
+// Silhouettes for the solver, in world px: tiles of the given layers at lens kk (only where they are on the figure),
+// plus their exit fragments. Returns how many tiles/fragments the padded box touches.
+function tilesIn(box, pad, kk, chs = [0, 1, 2]) {
+  let n = 0;
+  const bx0 = Math.max(0, box[0] - pad), by0 = Math.max(0, box[1] - pad), bx1 = Math.min(W, box[0] + box[2] + pad), by1 = Math.min(H, box[1] + box[3] + pad);
+  if (bx1 <= bx0 || by1 <= by0) return 0;
+  for (const ch of chs) {
+    const g = ch === 0 ? L.R : ch === 1 ? L.G : L.B, [ox, oy] = offs(ch - 1, kk);
+    const x0 = Math.floor((bx0 - ox) / T), x1 = Math.floor((bx1 - ox - 0.01) / T), y0 = Math.floor((by0 - oy) / T), y1 = Math.floor((by1 - oy - 0.01) / T);
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) if (cell(g, x, y)) n++;
+    const f = L.layers[ch] && L.layers[ch].frag;
+    if (f && ovl([bx0, by0, bx1 - bx0, by1 - by0], [f[0] + ox, f[1] + oy, f[2], f[3]], 0)) n++;
+  }
+  return n;
+}
+function strip(x0, y0, x1, y1, w0, w1) {
+  const dx = x1 - x0, dy = y1 - y0, l = Math.hypot(dx, dy) || 1, nx = -dy / l, ny = dx / l;
+  ctx.beginPath();
+  ctx.moveTo(x0 + nx * w0 / 2, y0 + ny * w0 / 2); ctx.lineTo(x1 + nx * w1 / 2, y1 + ny * w1 / 2);
+  ctx.lineTo(x1 - nx * w1 / 2, y1 - ny * w1 / 2); ctx.lineTo(x0 - nx * w0 / 2, y0 - ny * w0 / 2);
+  ctx.closePath(); ctx.fill();
+}
+function tri(x, y, ang, s) {
+  ctx.beginPath(); ctx.moveTo(x, y);
+  ctx.lineTo(x - Math.cos(ang - 0.45) * s, y - Math.sin(ang - 0.45) * s);
+  ctx.lineTo(x - Math.cos(ang + 0.45) * s, y - Math.sin(ang + 0.45) * s);
+  ctx.closePath(); ctx.fill();
+}
+// Where to hang a layer's numeral: a visible top corner, else that layer's door part (phantoms only), else any top tile.
+function pickTop(ch, ox, oy, tx0, ty0, corners, vis = false) {
+  let best = null, bd = Infinity;
+  const others = [0, 1, 2].filter(c => c !== ch);
+  for (const [tx, ty, side] of L.layers[ch].tops) {
+    if (corners && !side) continue;
+    const x = (side && corners ? tx + (side > 0 ? 1 : 0) : tx + 0.5) * T + ox, y = ty * T + oy;
+    if (x < 1.5 * T || x > W - 1.5 * T || y < T || y > H - T / 2) continue;
+    // a numeral points at a part where it can be seen: not at a corner another layer's paper lies over
+    if (vis && tilesIn([x - 7, y - 7, 14, 14], 0, k, others)) continue;
+    const d = (x - tx0) ** 2 + 4 * (y - ty0) ** 2;
+    if (d < bd) { bd = d; best = [x, y]; }
+  }
+  return best;
+}
+function layerAnchor(ch, kk, tx0, ty0, door) {
+  const [ox, oy] = offs(ch - 1, kk), dp = L.layers[ch].door, d = [dp[0] + ox, dp[1] + oy];
+  const doorOk = door && d[0] > T && d[0] < W - T && d[1] > T && d[1] < H;
+  // the part itself (not a phantom): only a corner that can be seen; fall back to any if none can
+  const vis = !door;
+  return pickTop(ch, ox, oy, tx0, ty0, true, vis) || (doorOk ? d : pickTop(ch, ox, oy, tx0, ty0, false, vis))
+    || (vis ? pickTop(ch, ox, oy, tx0, ty0, true) || pickTop(ch, ox, oy, tx0, ty0, false) : null);
 }
 
-function drawEnd() {
-  splitText('CHROMATIC DRIFT', 40, H / 2 - 30, Math.sin(time * 1.5) * 4);
-  ctx.font = '14px ui-monospace, Menlo, monospace'; ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(255,255,255,0.7)';
-  const mm = Math.floor(runT / 60), ss = String(Math.floor(runT % 60)).padStart(2, '0');
-  ctx.fillText(`prototype complete · ${mm}:${ss} · deaths: ${deaths}`, W / 2, H / 2 + 20);
-  ctx.fillText(`press ${K('KeyR')} to play again`, W / 2, H / 2 + 44);
+const sheetInk = () => state === 'title' ? INK[0] : state === 'end' ? INK5 : state === 'brief' ? PAPER.cream : INK[(L ? li : 0) % 4];
+const nextInk = () => li + 1 < LEVELS.length ? INK[(li + 1) % 4] : INK5;
+const labelCol = () => { const s = sheetInk(); return s === INK[0] || s === PAPER.cream ? PAPER.black : PAPER.white; };
+let hoverDial = false, numRatio = 0.72;
+// The patent apparatus is on every sheet: every part present carries its numeral (FIRST is kept only for the
+// record of where each part first appears).
+function showNum() { return true; }
+// Numerals are read at 100% for 2.5 s after a sheet's furniture lands, then sit at 45% (an exit: power2.in);
+// back to 100% on hover of the dial or at a death.
+function numAlpha() {
+  if (hoverDial || (fx.dead && fx.dead.age >= FREEZE)) return 1;
+  const a = fx.sheetAge - 0.34 - NUM_FULL;
+  if (a <= 0) return 1;
+  if (RM) return NUM_DIM;
+  const u = clamp(a / NUM_FADE, 0, 1);
+  return 1 - (1 - NUM_DIM) * u * u;
+}
+let offCv = null, offCtx = null, escCv = null;
+function offCanvas() {
+  if (!offCv || offCv.width !== cv.width || offCv.height !== cv.height) {
+    offCv = document.createElement('canvas'); offCv.width = cv.width; offCv.height = cv.height;
+    offCtx = offCv.getContext('2d', { alpha: false });
+  }
+  return offCtx;
+}
+// Esc moves paper: the frame on screen is kept as a card (a snapshot of the drawing canvas) so it can be moved as one piece.
+function snapCard(mode) {
+  if (RM || !cv.width) { fx.esc = null; return; }
+  if (!escCv || escCv.width !== cv.width || escCv.height !== cv.height) { escCv = document.createElement('canvas'); escCv.width = cv.width; escCv.height = cv.height; }
+  const x = escCv.getContext('2d', { alpha: false }); x.setTransform(1, 0, 0, 1, 0, 0); x.drawImage(cv, 0, 0);
+  fx.esc = { mode, age: 0, ink: sheetInk() }; fx.jump = null;
+}
+function render() {
+  fx.lifts.length = 0; fx.under = null; fx.chipDev = null;
+  // Completion: the finished sheet is drawn on its own card, then pulled off to show the next ink.
+  const pull = state === 'win' && !RM && fx.winAge >= PULL0;
+  // Esc into the Brief: the Brief is drawn on its own card, which lands on top while the sheet drops out beneath it.
+  const escIn = state === 'brief' && fx.esc && fx.esc.mode === 'in';
+  if (pull || escIn) ctx = offCanvas();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1; ctx.setLineDash([]);
+  ctx.fillStyle = sheetInk(); ctx.fillRect(0, 0, cv.width, cv.height);
+  if (state === 'title') drawCover();
+  else if (state === 'end') drawGrant(fx.endAge, true);
+  else if (state === 'brief') drawBrief();
+  else drawSheet();
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.setLineDash([]);
+  if (pull) { ctx = ctx0; drawPull(); }
+  else if (escIn) { ctx = ctx0; drawEscIn(); }
+  else if (fx.esc && fx.esc.mode === 'out') drawEscOut();
+  if (fx.jump && !pull && !escIn) drawJump();
+  // a card moving over (or carrying) the rail: the chip is no longer where it was drawn
+  if (pull || escIn || fx.jump || (fx.esc && fx.esc.mode === 'out')) fx.chipDev = null;
+  if (muted) drawMuteMark();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (!G) document.body.style.background = pull ? nextInk() : sheetInk();
+}
+// Esc: the sheet drops 120 px and tilts out (power2.in, 380 ms), opening the dark of the rostrum table above it;
+// 160 ms in, the Brief card lands on it from 40 px above (signature curve, 320 ms), its shadow on the falling sheet
+// growing as the sheet falls away from it.
+function drawEscIn() {
+  const e = fx.esc, S = VIEW.S, Wd = cv.width, Hd = cv.height;
+  const u = clamp(e.age / ESC_DROP, 0, 1), d = u * u, la = e.age - ESC_DELAY;
+  fx.under = e.ink;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = PAPER.black; ctx.fillRect(0, 0, Wd, Hd);
+  const m = new DOMMatrix().translate(Wd / 2, Hd / 2 + 120 * S * d).rotate(-2.5 * d).translate(-Wd / 2, -Hd / 2);
+  ctx.setTransform(m); ctx.drawImage(escCv, 0, 0);
+  if (la < 0) { ctx.setTransform(1, 0, 0, 1, 0, 0); return; }
+  const a = SIG(la / ESC_LAND), by = -40 * S * (1 - a), l = (4 + 10 * u) * S;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (SOFT()) fx.lifts.push([Wd / 2, Hd / 2 + by, Wd / 2, Hd / 2, 0, l]);
+  else { ctx.fillStyle = 'rgba(20,18,16,0.3)'; ctx.fillRect(l * 0.6, by + l, Wd, Hd); }
+  ctx.drawImage(offCv, 0, by);
+}
+// Esc / C out of the Brief: the Brief card is lifted up and away (power2.in, 320 ms), its shadow growing as it rises.
+function drawEscOut() {
+  const e = fx.esc, S = VIEW.S, Wd = cv.width, Hd = cv.height;
+  const u = clamp(e.age / ESC_LIFT, 0, 1), d = u * u;
+  if (u >= 1) return;
+  const m = new DOMMatrix().translate(Wd, -Hd * 1.06 * d).rotate(2 * d).translate(-Wd, 0);
+  const c = m.transformPoint(new DOMPoint(Wd / 2, Hd / 2)), l = (4 + 16 * d) * S;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (SOFT()) fx.lifts.push([c.x, c.y, Wd / 2, Hd / 2, 2 * d * Math.PI / 180, l]);
+  else { ctx.setTransform(m.translate(l * 0.6, l)); ctx.fillStyle = 'rgba(20,18,16,0.3)'; ctx.fillRect(0, 0, Wd, Hd); }
+  ctx.setTransform(m); ctx.drawImage(escCv, 0, 0);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+// Sheet change as paper (final round): the card is lifted off the light box in 120 ms (signature curve: shadow
+// 2/4 -> 12/28 px offset/blur, -6 px, -0.6 deg), then slides away along the lens axis in 420 ms on
+// cubic-bezier(.7,0,.2,1), its shadow kept. Whatever is under it (the next sheet's field) is already drawn.
+// img: the card (a canvas the size of the frame); u: seconds since the lift began; axis 'x' / 'y'; sgn: which way.
+function drawCard(img, u, horiz, sgn) {
+  const S = VIEW.S, Wd = cv.width, Hd = cv.height, J = S / 1.5;          // device px per 1440-frame px
+  const a = RM ? 1 : SIG(clamp(u / CARD_LIFT, 0, 1)), v = clamp((u - CARD_LIFT) / CARD_SLIDE, 0, 1), e = CARD_EASE(v);
+  if (v >= 1) return false;
+  const off = (2 + 10 * a) * J, blur = (4 + 24 * a) * J, rot = -0.6 * a;
+  const tx = horiz ? -sgn * Wd * 1.04 * e : 0, ty = (horiz ? 0 : -sgn * Hd * 1.06 * e) - 6 * J * a;
+  const m = new DOMMatrix().translate(Wd / 2 + tx, Hd / 2 + ty).rotate(rot).translate(-Wd / 2, -Hd / 2);
+  const c = m.transformPoint(new DOMPoint(Wd / 2, Hd / 2));
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (SOFT()) fx.lifts.push([c.x, c.y, Wd / 2, Hd / 2, rot * Math.PI / 180, off, blur * 0.8]);
+  else {
+    // the 2D tiers: the same shadow from the canvas itself (offsets and blur are in device px, outside the transform)
+    ctx.save(); ctx.setTransform(m);
+    ctx.shadowColor = 'rgba(20,18,16,0.34)'; ctx.shadowBlur = blur; ctx.shadowOffsetX = 0.6 * off; ctx.shadowOffsetY = off;
+    ctx.fillStyle = PAPER.black; ctx.fillRect(0, 0, Wd, Hd); ctx.restore();
+  }
+  ctx.setTransform(m); ctx.drawImage(img, 0, 0);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  return true;
+}
+// Completion: ALLOWED holds, then the finished card is lifted and pulled off along the sheet's lens axis, the way the
+// lens moved red to open the door. Underneath, the next sheet's field is already there with its numeral cut in.
+function drawPull() {
+  const u = fx.winAge - PULL0, Wd = cv.width, Hd = cv.height, sgn = Math.sign(L.kd) || 1;
+  fx.under = nextInk();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = fx.under; ctx.fillRect(0, 0, Wd, Hd);
+  if (li + 1 < LEVELS.length) {
+    setBase(); ctx.font = bs(NUMG.hgt / numRatio, 900); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = PAPER.cream;
+    ctx.fillText(String(li + 2), NUMG.x, NUMG.top + NUMG.hgt);
+    fx.pulled = li + 1;
+  }
+  // red moves -k along the axis: the sheet leaves the way red went (left / up for a positive lens)
+  drawCard(offCv, u, !!L.ax, sgn);
+}
+// A jump to another sheet (a digit, or a line of the Brief) moves the same paper instead of a hard cut: the frame on
+// screen is kept as a card and lifted and slid off the new sheet, which is already laid underneath it.
+let jumpCv = null;
+function snapJump() {
+  fx.jump = null;
+  if (RM || !cv.width) return;
+  if (!jumpCv || jumpCv.width !== cv.width || jumpCv.height !== cv.height) { jumpCv = document.createElement('canvas'); jumpCv.width = cv.width; jumpCv.height = cv.height; }
+  const x = jumpCv.getContext('2d', { alpha: false }); x.setTransform(1, 0, 0, 1, 0, 0); x.drawImage(cv, 0, 0);
+  const onSheet = L && (state === 'play' || state === 'dead' || state === 'win');
+  fx.jump = { age: 0, ink: fx.under && state === 'win' ? fx.under : sheetInk(), from: onSheet ? { ax: L.ax, kd: L.kd } : null };
+}
+function jumpTo(i, fn) {
+  snapJump();
+  fx.esc = null; fx.jumpPre = fx.jump ? i : -1;
+  fn(i);
+  // the card leaves along the axis of the sheet it showed (or, for the Brief / cover, of the sheet it opens)
+  if (fx.jump) { const f = fx.jump.from || { ax: L.ax, kd: L.kd }; fx.jump.horiz = !!f.ax; fx.jump.sgn = Math.sign(f.kd) || 1; }
+}
+function drawJump() {
+  const j = fx.jump;
+  fx.under = j.ink;
+  if (!drawCard(jumpCv, j.age, j.horiz, j.sgn)) fx.jump = null;
+}
+const mixHex = (a, b, t) => { const p = hex3(a), q = hex3(b); return `rgb(${p.map((v, i) => Math.round((v + (q[i] - v) * t) * 255)).join(',')})`; };
+const rgbHex = c => '#' + c.match(/\d+/g).slice(0, 3).map(v => (+v).toString(16).padStart(2, '0')).join('');
+// The sheet's huge FIG. numeral: full scale behind the figure like a title card while the sheet cuts in,
+// then (r: 0 -> 1) it retracts into the title block above dial 20, clear of the figure.
+const NUMG = { x: 22, top: 58, hgt: 412 };
+function bigNumeral(txt, age, r = 0, g = NUMG, col = PAPER.cream) {
+  const { x, top, hgt } = g, size = hgt / numRatio;
+  const s = fx.cut && fx.cut.kind !== 'fast' && !fx.cut.pre && r <= 0 ? slam(age) : 1;
+  ctx.font = bs(size, 900); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = col;
+  if (r <= 0) {
+    const travel = x + 0.62 * size * txt.length + 40;          // comes in from off the left edge
+    ctx.fillText(txt, x - travel * (1 - s), top + hgt);
+    fx.numFull = s === 1;
+    if (s === 1) numeralMask(txt, x, top, hgt, size);
+    return;
+  }
+  fx.numFull = false;
+  const w = ctx.measureText(txt).width, sr = Math.min(98 / hgt, (RAIL - TB.x - 12) / w), sc = 1 + (sr - 1) * r;
+  ctx.save(); ctx.translate(x + (TB.x - x) * r, top + (52 - top) * r); ctx.scale(sc, sc);
+  ctx.fillText(txt, 0, hgt); ctx.restore();
+}
+// A coarse coverage grid of the settled FIG. numeral (4 logical px cells, world coords), so a
+// white numeral or dot that lands on the cream paper can switch to black paper instead.
+function numeralMask(txt, x, top, hgt, size) {
+  const key = `${txt}|${x}|${top}|${hgt}|${numRatio}`;
+  if (fx.numMask && fx.numMask.key === key) return;
+  const C = 4, w = Math.ceil((ctx.measureText(txt).width + 8) / C), h = Math.ceil((hgt + 8) / C);
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const m = c.getContext('2d', { willReadFrequently: true });
+  m.scale(1 / C, 1 / C); m.font = bs(size, 900); m.textBaseline = 'alphabetic'; m.fillStyle = '#000';
+  m.fillText(txt, 0, hgt);
+  const a = m.getImageData(0, 0, w, h).data, data = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) data[i] = a[i * 4 + 3] > 96 ? 1 : 0;
+  fx.numMask = { key, x0: x, y0: top, w, h, C, data };          // in base units
+}
+// (bx, by, bw, bh): a box in world px, tested against the numeral's mask in base units.
+function onNumeral(wx, wy, ww = 0, wh = 0) {
+  const M = fx.numMask; if (!M || !fx.numFull || state === 'title') return false;
+  const [bx, by] = w2b(wx, wy), bw = ww * WP.Z, bh = wh * WP.Z;
+  let n = 0, on = 0;
+  for (let y = by; y <= by + bh; y += M.C) for (let x = bx; x <= bx + bw; x += M.C) {
+    const cx = Math.floor((x - M.x0) / M.C), cy = Math.floor((y - M.y0) / M.C);
+    n++; if (cx >= 0 && cy >= 0 && cx < M.w && cy < M.h && M.data[cy * M.w + cx]) on++;
+  }
+  return n > 0 && on / n > 0.2;
+}
+// Hanging green blocks hang from the top of the sheet on two black cords.
+function cordsOf() {
+  if (L.cords) return L.cords;
+  const out = [], [gx, gy] = offs(0, 0);
+  for (let ty = 0; ty < MH; ty++) {
+    let run = -1;
+    for (let tx = 0; tx <= MW; tx++) {
+      const on = tx < MW && cell(L.G, tx, ty) === BLOCK && cell(L.G, tx, ty - 1) !== BLOCK;
+      if (on && run < 0) run = tx;
+      if (!on && run >= 0) {
+        const y = ty * T + gy, x0 = run * T + gx, x1 = tx * T + gx;
+        if (y < 4 * T && x1 > 0 && x0 < W) out.push([x0 + T * 0.6, y], [x1 - T * 0.6, y]);
+        run = -1;
+      }
+    }
+  }
+  return (L.cords = out);
+}
+// The cords hang from the top of the frame (wherever the world sits in it).
+const cordTop = () => b2w(0, WP.vTop + 4)[1];
+function drawCords(dy) {
+  setWorld(); ctx.fillStyle = PAPER.black;
+  const y0 = cordTop();
+  for (const [x, y] of cordsOf()) { strip(x, y0 + dy, x, y + 5 + dy, 2.4, 2.4); ctx.fillRect(x - 4, y0 - 2 + dy, 8, 5); }
+}
+// The title card in the rows proven free (WP.band, base units): the sheet's title block ("SHEET n OF 10 · NAME",
+// 13 px condensed caps, ink at 70%) and, where the band is tall enough, the level's name as large cut paper in the
+// field's own tint (never a playable colour). Arrives with the furniture on the signature curve.
+const tintOf = ink => mixHex(ink, lightInk(ink) ? '#000000' : '#ffffff', lightInk(ink) ? 0.1 : 0.075);
+function titleLayout() {
+  const b = WP.band; if (!b || !L) return null;
+  if (L.title && L.title.key === `${b.top}|${b.bot}|${b.x1}|${WP.Z}`) return L.title;
+  const sm = JPX(13), txt = `SHEET ${li + 1} OF ${LEVELS.length} · ${L.name}`;
+  ctx.font = bs(sm, 800);
+  const tw = ctx.measureText(txt).width;
+  // keep clear of the cords (they hang through the band from the top of the frame)
+  const cords = cordsOf().map(([x]) => w2b(x, 0)[0]);
+  let x1 = b.x1;
+  for (let i = 0; i < 8; i++) { const hit = cords.find(cx => cx > x1 - tw - 8 && cx < x1 + 8); if (hit === undefined) break; x1 = hit - 10; }
+  let small = { txt, x1, y: b.top + sm * 0.78, box: [x1 - tw, b.top, tw, sm * 0.8] }, big = null;
+  const room = b.bot - (b.top + sm + 12);
+  if (room >= 56) {
+    ctx.font = bs(100, 900); ctx.textBaseline = 'alphabetic'; const m = ctx.measureText(L.name), asc = m.actualBoundingBoxAscent || 72;
+    let size = 100 * Math.min(room, 150) / asc;
+    const maxW = (b.x1 - b.x0) * 0.82;
+    if (m.width * size / 100 > maxW) size = 100 * maxW / m.width;
+    const bw = m.width * size / 100, bh = asc * size / 100;
+    big = { size, x1: b.x1, y: b.bot, box: [b.x1 - bw, b.bot - bh, bw, bh] };
+    // the title block sits right on top of the name, flush with its right edge
+    const ys = b.bot - bh - 10;
+    if (x1 === b.x1) small = { txt, x1, y: ys, box: [x1 - tw, ys - sm * 0.78, tw, sm * 0.8] };
+  }
+  return (L.title = { key: `${b.top}|${b.bot}|${b.x1}|${WP.Z}`, small, big });
+}
+function drawTitleBand(lc, u) {
+  const tl = titleLayout(); if (!tl || u <= 0) return;
+  setBase();
+  const e = RM ? 1 : SIG(u), dy = 10 * (1 - e);
+  ctx.textAlign = 'right'; ctx.textBaseline = 'alphabetic';
+  if (tl.big) { ctx.fillStyle = tintOf(sheetInk()); ctx.font = bs(tl.big.size, 900); ctx.fillText(L.name, tl.big.x1, tl.big.y + dy); }
+  ctx.globalAlpha = 0.7 * e; ctx.fillStyle = lc; ctx.font = bs(JPX(13), 800);
+  ctx.fillText(tl.small.txt, tl.small.x1, tl.small.y + dy * 0.5);
+  ctx.globalAlpha = 1;
+}
+// The title card's boxes in world px (for the label solver and the door callout).
+function titleObstacles() {
+  const tl = titleLayout(); if (!tl) return [];
+  return [tl.small, tl.big].filter(Boolean).map(({ box }) => { const [x, y] = b2w(box[0], box[1]); return [x, y, box[2] / WP.Z, box[3] / WP.Z]; });
+}
+// The visible part of the frame right of the rail, in world px.
+function visWorld() {
+  const [x0, y0] = b2w(RAIL + 2, WP.vTop + 4), [x1, y1] = b2w(WP.vR - 4, WP.vBot - 4);
+  return [x0, y0, x1, y1];
+}
+function drawSheet() {
+  const dead = state === 'dead', lc = labelCol();
+  const furn = dropIn(3), showFurniture = furn > 0;
+  drawTitleBand(lc, furn);
+  setBase();
+  const ret = fx.cut && fx.cut.kind === 'sheet' ? numeralRetract() : 1;
+  bigNumeral(String(li + 1), fx.cut ? fx.cut.age : 9, ret);
+  if (showFurniture) { ctx.font = bs(30, 800); ctx.fillStyle = lc; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillText('FIG.', TB.x, 39); }
+
+  // the three layers drop in on three beats: green (with its cords), red (with the runner), blue
+  for (const i of [1, 0, 2]) {
+    const u = dropIn([1, 0, 2].indexOf(i)); if (!u) continue;
+    const [ox, oy] = offs(i - 1, k), [sx, sy] = settleOff(i);
+    drawLayer(L.layers[i], devX(ox + sx), devY(oy + sy + dropPx(u)));
+    if (i === 1) drawCords(dropPx(u));
+  }
+  setWorld();
+  const dx = L.door.x * T, dy = L.door.y * T, aligned = fx.alignAge >= 0;
+
+  const ph = state === 'play' && showFurniture ? phantomStops() : null;
+  // a new pair of stops: the phantoms fade in again, and any forced fork is reconsidered
+  if (ph) { const key = `${ph.strong}|${ph.faint}`; if (key !== fx.phKey) { fx.phKey = key; fx.phIn = 0; fx.forkMemo = {}; } }
+  const phA = (RM ? 1 : furn * clamp(fx.phIn / PH_IN, 0, 1)) * fx.phA;
+  if (ph && phA > 0.004) {
+    if (ph.faint !== null) drawPhantoms(ph.faint, phA * PH_FAINT_A, false);
+    if (ph.strong !== null) drawPhantoms(ph.strong, phA, true);
+  }
+  setWorld();
+  if (aligned) {                                     // above the phantoms: it is the part that now exists
+    // the door's paper stands up off the sheet as 18 strikes: a shadow grows under it
+    const l = RM ? DOOR_LIFT : DOOR_LIFT * SIG(clamp((fx.alignAge - LEADER_T + 0.04) / 0.16, 0, 1));
+    lift(dx + T / 2 - l * 0.5, dy + T + 1.5 - l * 0.5, (T - 6) / 2, (2 * T - 3) / 2, 0, l);
+    setWorld(); ctx.fillStyle = PAPER.white; ctx.fillRect(dx + 3 - l * 0.5, dy + 3 - l * 0.5, T - 6, 2 * T - 3);
+  }
+  const travel = ph && ph.strong !== null ? drawTravel(ph.strong, lc) : null;
+  drawPrior(lc);
+  const rs = p.grounded ? settleOff(0) : [0, 0];    // carried: the runner rides the red layer's settle too
+  if (dropIn(1)) { drawRunner(dead, p.x - 1 + rs[0], p.y + 4 + rs[1]); if (p.wet && !dead) drawSubmerged(); }
+  const gap = state === 'play' && !p.grounded && !p.wet && showFurniture ? drawGapDimension(lc) : null;
+  if (fx.dead && fx.dead.age >= FREEZE) drawDeathCircle(fx.dead, lc);
+
+  let stamp = null;
+  if (fx.stamp) {
+    const a = fx.clock - fx.stamp.born;
+    stamp = { ...fx.stamp, age: a, out: a > STAMP_HOLD ? clamp((a - STAMP_HOLD) / STAMP_OUT, 0, 1) : 0 };
+  } else if (state === 'win' && fx.winAge >= 0) {
+    stamp = { word: 'ALLOWED', paper: PAPER.white, ink: PAPER.black, x: clamp(dx - 40, 110, W - 110), y: clamp(dy - 70, 40, H - 70), rot: 0.05, age: fx.winAge, sub: `FIG. ${li + 1}`, out: 0 };
+  }
+  // the door callout is solved once, at alignment, so its leader never moves while it draws
+  if (aligned && !fx.door) fx.door = doorCallout(dx, dy);
+  if (!aligned) fx.door = null;
+  if (showFurniture) {
+    const labels = [], runBox = [p.x - 3, p.y + 2, 26, 26], obstacles = [runBox];
+    if (aligned) obstacles.push([dx - 4, dy - 4, T + 8, 2 * T + 8]);
+    if (travel) obstacles.push(travel);
+    if (gap) obstacles.push(gap);
+    if (fx.dead && fx.dead.age >= FREEZE) obstacles.push([fx.dead.at.x - 26, fx.dead.at.y - 24, 52, 48]);
+    // the runner's phantoms are silhouettes too
+    if (ph && p.grounded) for (const st of [ph.strong, ph.faint]) if (st !== null && phantomRunnerOn(st)) {
+      const [a0, b0] = offs(-1, k), [a1, b1] = offs(-1, st);
+      obstacles.push([p.x - 1 + a1 - a0, p.y + 4 + b1 - b0, 22, 22]);
+    }
+    const ct = cordTop();
+    for (const [x, y] of cordsOf()) obstacles.push([x - 4, ct, 8, y - ct]);
+    obstacles.push(...titleObstacles());
+    const a10 = [p.x + p.w + 1, p.y + 5];
+    let a10p = null, a12 = null, a12p = null, a16 = null, a16p = null;
+    a12 = layerAnchor(0, k, W * 0.4, H);
+    if (ph && ph.strong !== null) a12p = layerAnchor(0, ph.strong, W * 0.55, H, true);
+    if (ph && ph.strong !== null && p.grounded && phantomRunnerOn(ph.strong)) {
+      const [a0, b0] = offs(-1, k), [a1, b1] = offs(-1, ph.strong);
+      a10p = [p.x + a1 - a0 + (a1 < a0 ? -1 : p.w + 1), p.y + b1 - b0 + 5];
+    }
+    if (L.layers[2].cells) a16 = layerAnchor(2, k, W * 0.35, 0);
+    if (ph && ph.strong !== null && L.layers[2].cells) a16p = layerAnchor(2, ph.strong, W * 0.6, 0, true);
+    const away = (a, b) => a && b ? norm(a[0] - b[0], a[1] - b[1]) : null;
+    // every numeral at 100% for 2.5 s on entry, then 45%; the primed ones also fade with their phantoms
+    const na = numAlpha(), pa = na * phA, LS = 24;
+    // a numeral and its primed twin: one forked callout when they are within 64 px, else two
+    const forced = fx.forkMemo || (fx.forkMemo = {});
+    const pair = (n, a, ap, alA, extra = {}) => {
+      if (a && ap && pa > 0.004 && (Math.hypot(a[0] - ap[0], a[1] - ap[1]) <= JW(64) || forced[n]))
+        labels.push({ key: n + '+', txt: `${n} / ${n}′`, anchors: [a, ap], col: lc, size: LS, al: alA, ...extra });
+      else {
+        if (a) labels.push({ key: n, txt: n, x: a[0], y: a[1], away: away(a, ap), col: lc, size: LS, al: alA, ...extra });
+        if (ap && pa > 0.004) labels.push({ key: n + "'", txt: `${n}′`, x: ap[0], y: ap[1], away: away(ap, a), col: lc, size: LS, al: pa, ...extra });
+      }
+    };
+    const show10 = state !== 'win' && !(dead && fx.dead.age < FREEZE);
+    pair('10', show10 ? a10 : null, show10 ? a10p : null, na);
+    pair('12', a12, a12p, na);
+    if (L.layers[1].cells) {
+      const a14 = layerAnchor(1, 0, W * 0.6, H * 0.5);
+      if (a14) labels.push({ key: '14', txt: '14', x: a14[0], y: a14[1], col: lc, size: LS, al: na });
+    }
+    pair('16', a16, a16p, na);
+    if (fx.door) obstacles.push(fx.door.box, ...fx.door.trail);
+    const shown = ph ? [ph.strong, ph.faint].filter(v => v !== null) : [];
+    // the rail's chip and glosses are obstacles too (in world px; they lie left of the figure)
+    for (const b of railLayout().boxes) { const [x, y] = b2w(b[0], b[1]); obstacles.push([x, y, b[2] / WP.Z, b[3] / WP.Z]); }
+    const opts = {
+      audit: true,
+      // a stamp: every label and leader keeps 24 px clear of its slip and caption; leaders never cross the dotted arc
+      stamp: stamp ? stampAABB(stamp.word, stamp.x, stamp.y, stamp.rot) : null,
+      arc: fx.stamp && fx.stamp.arc && fx.stamp.arc.length > 1 ? fx.stamp.arc : null,
+      solid: (b, pad) => tilesIn(b, pad, k),
+      soft: (b, pad) => shown.reduce((n, st) => n + tilesIn(b, pad, st, [0, 2]), 0),
+      green: b => tilesIn(b, 0, k, [1]) > 0,
+    };
+    // a numeral and its twin that can only be placed by colliding share one forked callout instead
+    const trial = placeLabels(labels, obstacles, visWorld(), { ...opts, dry: true });
+    let refork = false;
+    for (const n of ['10', '12', '16']) {
+      const bad = trial.some(q => (q.key === n || q.key === n + "'") && q.score >= 3000) && trial.some(q => q.key === n) && trial.some(q => q.key === n + "'");
+      if (bad && !forced[n]) { forced[n] = true; refork = true; }
+    }
+    let placed = trial;
+    if (refork) {
+      labels.length = 0;
+      pair('10', show10 ? a10 : null, show10 ? a10p : null, na); pair('12', a12, a12p, na);
+      if (L.layers[1].cells) { const a14 = layerAnchor(1, 0, W * 0.6, H * 0.5); if (a14) labels.push({ key: '14', txt: '14', x: a14[0], y: a14[1], col: lc, size: LS, al: na }); }
+      pair('16', a16, a16p, na);
+      placed = placeLabels(labels, obstacles, visWorld(), { ...opts, dry: true });
+    }
+    // while a stamp is down, a numeral that cannot keep 24 px off it (or would cross the dotted arc) yields: it is
+    // under the slip, and comes back when the slip is peeled off
+    if (opts.stamp || opts.arc) for (const q of placed) if (stampConflict(q, opts.stamp, opts.arc, 0)) { q.al = 0; q.yielded = true; }
+    drawPlaced(placed, opts);
+  } else fx.placed = [];
+  if (aligned && fx.door) drawDoorLeader(fx.door, fx.alignAge, lc);
+  if (showFurniture && ret >= 0.85) drawHud(ph, lc);   // the dial takes its place once the numeral has retracted
+  fx.lastAllowed = state === 'win' ? stamp : null;
+  if (stamp) stampAt(stamp, lc);
+}
+const norm = (x, y) => { const l = Math.hypot(x, y) || 1; return [x / l, y / l]; };
+// Vertical sheets: dimension the next lens stop on the red part nearest the runner (one stop = one tile).
+function drawTravel(stop, col) {
+  if (!L.ay) return null;
+  const [ox, oy] = offs(-1, k), [, oy1] = offs(-1, stop), d = oy1 - oy;
+  let best = null, bd = Infinity;
+  for (const [tx, ty, side] of L.layers[0].tops) {
+    if (!side) continue;
+    const x = (tx + (side > 0 ? 1 : 0)) * T + ox, y = ty * T + oy;
+    if (x < T || x > W - T || y < T * 1.5 || y > H - T * 0.5 || y + d < T) continue;
+    const dd = Math.abs(x - (p.x + p.w / 2)) + Math.abs(y - p.y) * 0.5;
+    if (dd < bd) { bd = dd; best = [x + side * 13, y]; }
+  }
+  if (!best) return null;
+  const [x, y] = best, y0 = Math.min(y, y + d), y1 = Math.max(y, y + d);
+  ctx.globalAlpha = (RM ? 1 : dropIn(3)) * fx.phA;
+  dimension(x, y0, y1, col);
+  ctx.globalAlpha = 1;
+  return [x - 9, y0 - 3, 18, y1 - y0 + 6];
+}
+// In water the runner is under the blue paper: it shows only through the cut stripes, and bubbles rise.
+function drawSubmerged() {
+  const [bx, by] = offs(1, k), S = WS();
+  ctx.save(); figureClip();
+  ctx.beginPath(); ctx.rect(devX(p.x - 2), devY(p.y + 3), Math.round(26 * S), Math.round(24 * S)); ctx.clip();
+  ctx.drawImage(L.layers[2], devX(bx), devY(by));
+  ctx.restore(); setWorld();
+  // the patent's hidden line: a part behind another is drawn dashed
+  ctx.strokeStyle = PAPER.black; ctx.lineWidth = 2.5; ctx.setLineDash([4, 3]);
+  ctx.strokeRect(p.x - 1 + 1.25, p.y + 4 + 1.25, 22 - 2.5, 22 - 2.5); ctx.setLineDash([]);
+  ctx.fillStyle = PAPER.cream;
+  for (let i = 0; i < 3; i++) {
+    const ph = RM ? (i + 0.5) / 3 : (fx.clock * 0.9 + i / 3) % 1;
+    const x = p.x + p.w / 2 + (i - 1) * 6 + (RM ? 0 : Math.sin(fx.clock * 5 + i * 2) * 2), y = p.y + 4 - ph * 34;
+    if (!hits(L.B, bx, by, x - 2, y - 2, 4, 4)) continue;
+    ctx.beginPath(); ctx.arc(x, y, 2.2 + i * 0.7, 0, Math.PI * 2); ctx.fill();
+  }
+}
+// The figure is cut to the world rectangle; inside a BORDER-wide band along that cut the
+// layer is drawn solid, so its slits stop short of the cut like they do at its own edges.
+function figureClip() {
+  const x0 = devX(0), y0 = devY(0);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.beginPath(); ctx.rect(x0, y0, devX(W) - x0, devY(H) - y0); ctx.clip();
+}
+function drawLayer(c, X, Y) {
+  ctx.save(); figureClip();
+  ctx.drawImage(c, X, Y);
+  const x0 = devX(0), y0 = devY(0), x1 = devX(W), y1 = devY(H), b = Math.round(BORDER * WS());
+  ctx.beginPath();
+  ctx.rect(x0, y0, x1 - x0, b); ctx.rect(x0, y1 - b, x1 - x0, b); ctx.rect(x0, y0, b, y1 - y0); ctx.rect(x1 - b, y0, b, y1 - y0);
+  ctx.clip();
+  ctx.drawImage(c.solid, X, Y);
+  ctx.restore();
+}
+// The runner's phantom only where the lens could carry it: a stop that would push it off the figure is refused by
+// the lens (applyK's bounds, read here, never called), so no 10′ is drawn there.
+function phantomRunnerOn(stop) {
+  const [a0, b0] = offs(-1, k), [a1, b1] = offs(-1, stop), nx = p.x + a1 - a0, ny = p.y + b1 - b0;
+  return nx >= 0 && nx + p.w <= W && ny >= -0.5 && ny + p.h <= H + 0.5;
+}
+function drawPhantoms(stop, alpha, strong) {
+  ctx.save(); figureClip();
+  ctx.globalAlpha = alpha;
+  for (const [ch, s] of [[0, -1], [2, 1]]) {
+    const [ox, oy] = offs(s, stop);
+    ctx.drawImage(strong ? L.layers[ch].ph : L.layers[ch].phF, devX(ox), devY(oy));
+  }
+  ctx.restore();
+  ctx.globalAlpha = alpha;
+  setWorld();
+  if (p.grounded && phantomRunnerOn(stop)) {
+    const [a0, b0] = offs(-1, k), [a1, b1] = offs(-1, stop), lw = strong ? PH_STRONG_W : PH_FAINT_W;
+    ctx.strokeStyle = phInkFor(li).run; ctx.lineWidth = lw; ctx.setLineDash(PH_DASH_RUN);
+    ctx.strokeRect(p.x - 1 + a1 - a0 + lw / 2, p.y + 4 + b1 - b0 + lw / 2, 22 - lw, 22 - lw);
+    ctx.setLineDash([]);
+  }
+  ctx.globalAlpha = 1;
+}
+// The runner is a square of black paper. (Drawn 22 px; the sim's box is still 20 x 26.)
+function drawRunner(dead, x = p.x - 1, y = p.y + 4, s = 22, face = p.face) {
+  ctx.setLineDash([]);
+  // on the dark fields the black paper square is mounted on a 2 px cream keyline, so it never sinks into the ground
+  if (!lightInk(sheetInk())) { ctx.fillStyle = KEYLINE; ctx.fillRect(x - 2, y - 2, s + 4, s + 4); }
+  ctx.fillStyle = PAPER.black; ctx.fillRect(x, y, s, s);
+  ctx.fillStyle = PAPER.white;
+  const e = s * 0.2;
+  ctx.fillRect(x + s / 2 + face * s * 0.18 - e / 2, y + s * 0.22, e, e);
+}
+function drawPrior(col) {
+  if (!fx.prior.length) return;
+  ctx.fillStyle = col; ctx.globalAlpha = 0.85;
+  for (const path of fx.prior) {
+    let acc = 0;
+    for (let i = 1; i < path.length; i++) {
+      const [x0, y0] = path[i - 1], [x1, y1] = path[i], l = Math.hypot(x1 - x0, y1 - y0);
+      let s = acc;
+      for (; s < l; s += 9) {
+        const u = s / l, x = x0 + (x1 - x0) * u, y = y0 + (y1 - y0) * u;
+        ctx.fillStyle = col === PAPER.white && onNumeral(x, y) ? PAPER.black : col;
+        ctx.beginPath(); ctx.arc(x, y, 2, 0, Math.PI * 2); ctx.fill();
+      }
+      acc = s - l;
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+// Airborne: you are not carried, so instead of a phantom runner, dimension the drop to red.
+function drawGapDimension(col) {
+  const [ox, oy] = offs(-1, k), y0 = p.y + p.h;
+  let d = 0;
+  for (let i = 1; i <= H - y0 + 2 * T; i++) if (hits(L.R, ox, oy, p.x, y0 + i - 1, p.w, 1)) { d = i - 1; break; }
+  if (d < 6) return null;
+  dimension(p.x + p.w + 9, y0, y0 + d, col);
+  return [p.x + p.w + 1, y0 - 2, 16, d + 4];
+}
+function dimension(x, y0, y1, col) {
+  ctx.fillStyle = col;
+  strip(x - 7, y0, x + 6, y0, 2, 2); strip(x - 7, y1, x + 6, y1, 2, 2);
+  strip(x, y0 + 7, x, y1 - 7, 2.2, 2.2);
+  tri(x, y0 + 1, -Math.PI / 2, 8); tri(x, y1 - 1, Math.PI / 2, 8);
+}
+function drawDeathCircle(d, col) {
+  const c = d.at, u = RM ? 1 : SIG((d.age - FREEZE) / CIRCLE_T), r = 19;
+  ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.lineCap = 'butt'; ctx.setLineDash([]);
+  ctx.beginPath(); ctx.ellipse(c.x, c.y, r + 3, r, -0.3, 0.3, 0.3 + (Math.PI * 2 + 0.6) * u); ctx.stroke();
+}
+// Door 18's callout, solved once at alignment: the number sits in open field (12 px clear of every silhouette, the
+// runner's walk to the door, the title card and the frame), up-right of the door by preference, on a leader at least
+// 24 px long that never crosses red (nor any other paper).
+const DOOR_ANG = [-45, -60, -30, -75, -90, -15, 0, -105, -120, -135, -150, 180, 15, 30, 45, 135, 90].map(a => a * Math.PI / 180);
+function doorCallout(dx, dy) {
+  ctx.font = bs(36, 900);
+  const nw = ctx.measureText('18').width + 4, nh = 36 * 0.74, door = [dx + 3, dy + 3, T - 6, 2 * T - 3];
+  const cx = dx + T / 2, cy = dy + T, clr = JW(12), vb = visWorld();
+  const walk = [Math.min(p.x, dx) - 4, Math.min(p.y, dy + 2 * T - 30) - 2, Math.abs(p.x - dx) + T + 8, 34];
+  const obst = [[p.x - 3, p.y + 2, 26, 26], walk, ...titleObstacles()];
+  let best = null, bs0 = Infinity;
+  DOOR_ANG.forEach((a, i) => [52, 64, 80, 100, 128, 160].forEach((R, j) => {
+    const C = [cx + Math.cos(a) * R, cy + Math.sin(a) * R], box = [C[0] - nw / 2, C[1] - nh / 2, nw, nh];
+    const e = nearOn(door, C[0], C[1]), s = nearOn(box, e[0], e[1]), len = Math.hypot(s[0] - e[0], s[1] - e[1]);
+    let sc = i * 1.5 + j * 1.2;
+    if (len < JW(24)) sc += 2000;
+    if (box[0] < vb[0] || box[1] < vb[1] || box[0] + nw > vb[2] || box[1] + nh > vb[3]) sc += 3000;
+    sc += 800 * Math.min(3, tilesIn(box, clr, k));
+    for (const o of obst) if (ovl(box, o, clr)) sc += 900;
+    // the leader: never across red; avoid green and blue too, and the runner
+    const l = Math.max(1, len), n = Math.ceil(l / 3);
+    for (let q = 1; q < n; q++) {
+      const u = q / n, x = s[0] + (e[0] - s[0]) * u, y = s[1] + (e[1] - s[1]) * u, pt = [x - 0.5, y - 0.5, 1, 1];
+      if ((1 - u) * l < 3) continue;                       // the leader's tip touches the door itself
+      if (tilesIn(pt, 1, k, [0])) { sc += 6000; break; }
+      if (tilesIn(pt, 1, k, [1, 2])) { sc += 400; break; }
+    }
+    sc += 300 * segHits(s[0], s[1], e[0], e[1], [obst[0]], 2);
+    if (sc < bs0) { bs0 = sc; best = { s, e, box, C }; }
+  }));
+  // the leader as small boxes, so the other labels keep off it
+  const { s, e } = best, trail = [];
+  for (let q = 0; q <= 4; q++) { const u = q / 4; trail.push([s[0] + (e[0] - s[0]) * u - 2, s[1] + (e[1] - s[1]) * u - 2, 4, 4]); }
+  return { ...best, trail };
+}
+// The door is never numbered in advance: on alignment a paper strip draws in from the number's place to the door on
+// the signature curve, then 1 and 8 slam in, 70 ms apart, on two typewriter strikes.
+function drawDoorLeader(dc, age, col) {
+  const { s, e, C } = dc, u = RM ? 1 : SIG(age / LEADER_T);
+  ctx.fillStyle = col;
+  strip(s[0], s[1], s[0] + (e[0] - s[0]) * u, s[1] + (e[1] - s[1]) * u, 3.4, 3.4 - 2.6 * u);
+  ctx.font = bs(36, 900); ctx.textBaseline = 'middle';
+  const w1 = ctx.measureText('1').width, w8 = ctx.measureText('8').width, x = C[0] - (w1 + w8) / 2, ty = C[1];
+  [['1', LEADER_T, x, w1], ['8', LEADER_T + 0.07, x + w1, w8]].forEach(([g, t0, gx, gw]) => {
+    const a = age - t0;
+    if (!RM && a < 0) return;
+    const sc = RM ? 1 : 1 + 0.6 * (1 - slam(a, 0.06, 0.04));
+    ctx.save(); ctx.translate(gx + gw / 2, ty); ctx.scale(sc, sc);
+    ctx.textAlign = 'center'; ctx.fillText(g, 0, 1); ctx.restore();
+  });
+  ctx.textBaseline = 'alphabetic';
+}
+// A placed label too near a stamp (24 px, box or leader) or on the dotted arc (12 px, or a leader across it).
+function stampConflict(q, sb, arc, e) {
+  if (sb && (ovl(q.box, sb, JW(24) - e) || q.legs.some(([ex, ey, x, y]) => segRect(ex, ey, x, y, sb, JW(24) - e, 0)))) return true;
+  if (arc && (arcNear(q.box, arc, JW(12) - e) || q.legs.some(([ex, ey, x, y]) => arcCross(ex, ey, x, y, arc)))) return true;
+  return false;
+}
+// The stamp's settled silhouette in world px (its slip and the caption under it, rotated): an axis-aligned box.
+const STAMP_H = 54, STAMP_SUB = 25;
+function stampAABB(word, x, y, rot) {
+  ctx.font = bs(44, 900);
+  const w = ctx.measureText(word).width + 30, c = Math.cos(rot), s = Math.sin(rot);
+  const pts = [[-w / 2, -STAMP_H / 2], [w / 2, -STAMP_H / 2], [w / 2, STAMP_H / 2 + STAMP_SUB], [-w / 2, STAMP_H / 2 + STAMP_SUB]].map(([u, v]) => [x + u * c - v * s, y + u * s + v * c]);
+  const xs = pts.map(q => q[0]), ys = pts.map(q => q[1]), x0 = Math.min(...xs), y0 = Math.min(...ys);
+  return [x0, y0, Math.max(...xs) - x0, Math.max(...ys) - y0];
+}
+// The dotted arc of the attempt that just failed: its last 3 s (world px).
+function deathArc() {
+  const path = fx.prior[fx.prior.length - 1] || [];
+  return path.slice(-91);
+}
+// ANTICIPATED is laid in open field: 40 px (1440 frame) clear above the highest point of the dotted arc under it and
+// above the circle, inside the frame, clear of the parts the numerals point at (now, and after the respawn) and of the
+// spawn, as near up-right of the contact as that allows. Presentation only: read from the sheet, never written to it.
+function placeStamp(c, arc) {
+  const vb = visWorld(), rot = -0.07, b0 = stampAABB('ANTICIPATED', 0, 0, rot), m24 = JW(24);
+  const pts = arc.concat([[c.x - 24, c.y - 24], [c.x + 24, c.y - 24]]);
+  // what the stamp should leave room around: the numerals' anchors (this frame's and the respawn's), the spawn
+  const anchors = [];
+  for (const q of fx.placed || []) anchors.push(...q.anchors);
+  for (const a of [layerAnchor(0, L.k0, W * 0.4, H), L.layers[2].cells ? layerAnchor(2, L.k0, W * 0.35, 0) : null, L.layers[1].cells ? layerAnchor(1, 0, W * 0.6, H * 0.5) : null]) if (a) anchors.push(a);
+  const sx = L.spawn.x * T + (T - 20) / 2, sy = (L.spawn.y + 1) * T - 26, spawn = [sx - 1, sy + 4, 22, 22];
+  let best = null;
+  const xs = [];
+  for (let x = vb[0] - b0[0] + 8; x <= vb[2] - b0[0] - b0[2] - 8; x += JW(24)) xs.push(x);
+  for (const x of xs) {
+    const x0 = x + b0[0] - m24, x1 = x + b0[0] + b0[2] + m24;
+    let apex = Infinity;
+    for (const [px, py] of pts) if (px >= x0 && px <= x1) apex = Math.min(apex, py);
+    // the lowest the stamp may sit here (40 px over the arc under it, or the frame's foot) and the highest (the top)
+    const yLo = apex < Infinity ? apex - JW(40) - (b0[1] + b0[3]) : vb[3] - 4 - (b0[1] + b0[3]), yHi = vb[1] + 4 - b0[1];
+    if (yLo < yHi) continue;
+    const y0 = clamp(c.y - 118, yHi, yLo);
+    for (let dy = -6; dy <= 6; dy++) {
+      const y = y0 + dy * JW(32), box = [x + b0[0], y + b0[1], b0[2], b0[3]];
+      if (y < yHi || y > yLo) continue;
+      let sc = Math.hypot(x - (c.x + 24), (y - (c.y - 118)) * 1.3) * 0.5 + (y > c.y - 118 ? (y - (c.y - 118)) * 2 : 0);
+      if (ovl(box, [c.x - 26, c.y - 24, 52, 48], JW(12))) sc += 5000;     // never over the circle
+      sc += 400 * Math.min(6, tilesIn(box, JW(12), k));                       // open field, not over the parts
+      sc += 300 * Math.min(6, tilesIn(box, JW(12), L.k0));                    // nor where they will be after the respawn
+      for (const a of anchors) if (ovl(box, [a[0], a[1], 0, 0], m24 + JW(30))) sc += 900;
+      if (ovl(box, spawn, JW(60))) sc += 1500;
+      if (!best || sc < best.sc) best = { x, y, sc };
+    }
+  }
+  if (best) return [best.x, best.y];
+  return [clamp(c.x + 24, vb[0] - b0[0] + 8, vb[2] - b0[0] - b0[2] - 8), vb[1] + 4 - b0[1]];
+}
+// A stamp is a slip of paper: it slams down (its shadow shrinks as it lands), sits, then is peeled up and away.
+function stampAt(st, subCol) {
+  const { word, paper, ink, x, y, rot, age, sub } = st, out = st.out || 0;
+  const land = RM ? 1 : clamp(age / STAMP_LAND, 0, 1);
+  const sc = RM ? 1 : 1 + 0.35 * (1 - slam(Math.max(0, age), STAMP_LAND, 0.04));
+  const e = out * out, oy = -(y + (WP.Y - WP.vTop) / WP.Z + 90) * e, r2 = rot - 0.3 * e;
+  if (e >= 1) return;
+  setWorld();
+  ctx.font = bs(44, 900); const w = ctx.measureText(word).width + 30, h = 54;
+  lift(x, y + oy, w / 2 * sc, h / 2 * sc, r2, (1 - SIG(land)) * 16 + e * 14);
+  setWorld(); ctx.save(); ctx.translate(x, y + oy); ctx.rotate(r2); ctx.scale(sc, sc);
+  ctx.fillStyle = paper; ctx.fillRect(-w / 2, -h / 2, w, h);
+  ctx.fillStyle = ink; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(word, 0, 2);
+  ctx.font = bs(18, 700); ctx.fillStyle = subCol; ctx.fillText(sub, 0, h / 2 + 16);
+  ctx.restore();
+}
+// Dial 20 and arrows 22/24 in the title block: black paper, cream notches.
+function drawHud(ph, lc) {
+  setBase();
+  const cx = TB.dialX, cy = TB.dialY, r = TB.r;
+  const ang = v => -Math.PI / 2 + v * (Math.PI * 0.75 / KMAX);
+  // the dial says what it is, and the stop it is on (signed)
+  const stop = Math.round(k);
+  ctx.fillStyle = lc; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.font = bs(17, 800); ctx.fillText('LENS', cx, cy - r - 9);
+  ctx.font = bs(24, 900); ctx.fillText(stop > 0 ? `+${stop}` : stop < 0 ? `–${-stop}` : '0', cx, cy + r + 28);
+  ctx.fillStyle = PAPER.black; ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = PAPER.cream;
+  for (let v = -KMAX; v <= KMAX; v++) { const a = ang(v), l = v ? 7 : 11; strip(cx + Math.cos(a) * (r - l), cy + Math.sin(a) * (r - l), cx + Math.cos(a) * (r - 2), cy + Math.sin(a) * (r - 2), v ? 2 : 3, v ? 2 : 3); }
+  if (ph) {
+    ctx.strokeStyle = PAPER.cream; ctx.lineWidth = 2.5; ctx.setLineDash([5, 3]);
+    for (const [st, al] of [[ph.faint, PHANTOM_FAINT], [ph.strong, 1]]) {
+      if (st === null) continue;
+      ctx.globalAlpha = al; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(ang(st)) * (r - 9), cy + Math.sin(ang(st)) * (r - 9)); ctx.stroke();
+    }
+    ctx.globalAlpha = 1; ctx.setLineDash([]);
+  }
+  ctx.fillStyle = PAPER.cream;
+  strip(cx, cy, cx + Math.cos(ang(k)) * (r - 9), cy + Math.sin(ang(k)) * (r - 9), 5, 2.4);
+  ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI * 2); ctx.fill();
+  // The carry state, worded as the cover's captions, in a cream chip (#F3EBDD) under the dial: 20 px condensed caps
+  // on 22 px leading, 6 px padding (1440-frame px). Inverted, red #C22A20 with cream type, while 10 is free of red.
+  const R = railLayout(), carried = p.grounded, c = R.chip;
+  const words = carried ? ['ON RED', 'CARRIED'] : p.wet ? ['IN WATER', 'NOT CARRIED'] : ['IN AIR', 'NOT CARRIED'];
+  ctx.fillStyle = carried ? CHIP.paper : CHIP.red; ctx.fillRect(c[0], c[1], c[2], c[3]);
+  ctx.fillStyle = carried ? CHIP.ink : CHIP.paper; ctx.font = bs(R.fs, 800); ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  words.forEach((t, i) => ctx.fillText(t, c[0] + c[2] / 2, R.base + i * R.lead));
+  fx.chipDev = [VIEW.offX + c[0] * VIEW.S, VIEW.offY + c[1] * VIEW.S, VIEW.offX + (c[0] + c[2]) * VIEW.S, VIEW.offY + (c[1] + c[3]) * VIEW.S];
+  // 22 / 24: which way red and blue go for the direction in use, along the level's axis, glossed RED / BLUE (16 px)
+  const dir = ph ? ph.dir : lensUI.dir, ay0 = R.ay0;
+  [[0, -dir], [2, dir]].forEach(([ch, s], j) => {
+    ctx.fillStyle = LAYER_COL[ch];
+    if (L.ax) {
+      const y = ay0 + j * RAIL_ROW, x0 = cx - 22, x1 = cx + 34, [a, b] = s > 0 ? [x0, x1 - 10] : [x1, x0 + 10];
+      stripedArrow(ch, a, y, b, y);
+    } else {
+      const x = cx - 18 + j * 36, y0 = ay0 - 8, y1 = ay0 + 50, [a, b] = s > 0 ? [y0, y1 - 10] : [y1, y0 + 10];
+      stripedArrow(ch, x, a, x, b);
+    }
+  });
+  ctx.fillStyle = lc; ctx.font = bs(R.gfs, 800); ctx.textBaseline = 'alphabetic';
+  for (const g of R.gloss) { ctx.textAlign = g.al; ctx.fillText(g.txt, g.x, g.y); }
+  // 20 / 22 / 24 on every sheet, at the numerals' strength (100% on entry, then 45%)
+  ctx.globalAlpha = numAlpha();
+  ctx.fillStyle = lc; ctx.font = bs(22, 800); ctx.textBaseline = 'middle';
+  ctx.textAlign = 'right'; ctx.fillText('20', cx - r * 0.72 - 3, cy - r * 0.72 - 14);   // up-left: the rail's right edge stays clear of the figure
+  if (L.ax) { ctx.textAlign = 'right'; ctx.fillText('22', cx - 26, ay0); ctx.fillText('24', cx - 26, ay0 + RAIL_ROW); }
+  else { ctx.textAlign = 'center'; ctx.fillText('22', cx - 18, ay0 + 70); ctx.fillText('24', cx + 18, ay0 + 70); }
+  ctx.globalAlpha = 1; ctx.textBaseline = 'alphabetic';
+  // the controls, typed at the rail's foot (Courier bold 16 px on 20 px, ink: no paper shadow), in the player's layout
+  ctx.font = cp(JPX(16), 700); ctx.textAlign = 'left'; ctx.fillStyle = lightInk(sheetInk()) ? TEXT_DARK : TEXT_LIGHT;
+  railKeys().forEach((t, i) => ctx.fillText(t, TB.x, RAIL_KEYS_Y + i * JPX(20)));
+}
+// The rail below the dial (base units): the carry chip, the arrows 22 / 24 with their glosses, the controls.
+const CHIP = { paper: '#f3ebdd', red: '#c22a20', ink: PAPER.black };
+const RAIL_ROW = 40, RAIL_KEYS_Y = 478;
+const railKeys = () => [`${K('KeyQ')}/${K('KeyE')} lens`, 'or wheel', `${K('KeyA')}/${K('KeyD')} move`, `${K('KeyW')} jump`, 'Esc sheets'];
+let railMemo = null;
+function railLayout() {
+  const vert = !!(L && L.ay), key = `${vert}|${numRatio}`;
+  if (railMemo && railMemo.key === key) return railMemo;
+  const cx = TB.dialX, fs = JPX(20), lead = JPX(22), pad = JPX(6), gfs = JPX(16);
+  ctx.font = bs(fs, 800);
+  const capH = ctx.measureText('CARRIED').actualBoundingBoxAscent || fs * 0.74;
+  const tw = Math.max(...['ON RED', 'CARRIED', 'IN AIR', 'IN WATER', 'NOT CARRIED'].map(t => ctx.measureText(t).width));
+  const w = Math.ceil(tw + 2 * pad), h = pad * 2 + capH + lead, top = TB.dialY + TB.r + 38;
+  const chip = [cx - w / 2, top, w, h], base = top + pad + capH;
+  const ay0 = top + h + (vert ? 28 : 20);
+  ctx.font = bs(gfs, 800);
+  const gH = ctx.measureText('BLUE').actualBoundingBoxAscent || gfs * 0.74;
+  // the glosses: under each horizontal arrow (from its tail), or under each vertical arrow's numeral
+  const gloss = vert
+    ? [['RED', cx - 18, ay0 + 90], ['BLUE', cx + 18, ay0 + 90]].map(([txt, x, y]) => ({ txt, x, y, al: 'center' }))
+    : [['RED', cx - 22, ay0 + 20], ['BLUE', cx - 22, ay0 + RAIL_ROW + 20]].map(([txt, x, y]) => ({ txt, x, y, al: 'left' }));
+  for (const g of gloss) { const gw = ctx.measureText(g.txt).width; g.box = [g.al === 'center' ? g.x - gw / 2 : g.x, g.y - gH, gw, gH]; }
+  return (railMemo = { key, fs, lead, gfs, chip, base, ay0, gloss, boxes: [chip, ...gloss.map(g => g.box)] });
+}
+// An arrow whose shaft is cut in its layer's hatching: red as vertical bars, blue as horizontal strips.
+function stripedArrow(ch, x0, y0, x1, y1) {
+  const l = Math.hypot(x1 - x0, y1 - y0), ux = (x1 - x0) / l, uy = (y1 - y0) / l, horiz = Math.abs(ux) > 0.5;
+  if ((ch === 0) === horiz) {
+    for (let s = 0; s < l - 2; s += 7) { const x = x0 + ux * s, y = y0 + uy * s; if (horiz) ctx.fillRect(x - 1.5, y - 6, 4, 12); else ctx.fillRect(x - 6, y - 1.5, 12, 4); }
+  } else {
+    for (const o of [-4, 2]) { if (horiz) ctx.fillRect(Math.min(x0, x1), y0 + o, l, 3); else ctx.fillRect(x0 + o, Math.min(y0, y1), 3, l); }
+  }
+  tri(x1 + ux * 12, y1 + uy * 12, Math.atan2(uy, ux), 16);
 }
 
-function vignette() {
-  const g = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, W * 0.65);
-  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.55)');
-  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+// The cover: FIG. 1's title card with a live figure the player can lens. Runner 10 on brick 12,
+// facing a gap. Grounded, the lens carries 10 with 12; airborne, it doesn't.
+const COVER = { STEP: 48, BX: 236, BY: 352, BW: 330, BH: 62, HOME: 196, RS: 34 };
+// The staged pair moves slowly enough to be read: one lens stop in 0.8 s, and a hop that stays up 0.96 s, so each
+// caption (900 ms) stands beside the thing it names for its whole life. The player's own Q/E turn it at full speed.
+const STAGED_RATE = 1.25, PLAYER_RATE = 6, HOP_G = 640, HOP_V = 307, CAPTION_T = 0.9;
+const cover = { t: 0, k: 0, kT: 0, dir: -1, x: 0, y: 0, vy: 0, air: false, idle: 99, walk: 0, fall: -1, pieces: null, rate: PLAYER_RATE, cap: null };
+function coverReset() { Object.assign(cover, { t: 0, k: 0, kT: 0, dir: -1, vy: 0, air: false, idle: 99, walk: 0, fall: -1, rate: PLAYER_RATE, cap: null }); cover.x = COVER.BX + COVER.HOME; cover.y = 0; }
+coverReset();
+function buildCover() {
+  cover.pieces = {
+    brick: cutPiece(COVER.BW, COVER.BH, PAPER.red, 0),
+    block: cutPiece(250, COVER.BH, PAPER.black, 2, { pitch: 14, sw: 5, border: 9 }),
+    pr: cutPiece(66, 150, PAPER.red, 0, { border: 6 }),
+    pg: cutPiece(66, 128, PAPER.green, 1, { border: 6 }),
+    pb: cutPiece(66, 108, PAPER.blue, 2, { border: 6 }),
+  };
+}
+const brickX = (kk = cover.k) => COVER.BX - kk * COVER.STEP;
+function coverLens(dir, player) {
+  const kT = clamp(Math.round(cover.kT) + dir, -2, 2);
+  if (kT === cover.kT) return;
+  cover.kT = kT; cover.dir = dir; cover.rate = player ? PLAYER_RATE : STAGED_RATE;
+  if (player) cover.idle = 0;
+  // the caption names what the figure is doing as the lens turns: carried on red, or not carried in the air
+  if (cover.fall < 0) cover.cap = { txt: cover.air ? 'IN THE AIR: NOT CARRIED' : 'ON RED: CARRIED', born: cover.t };
+}
+function coverHop() { if (!cover.air && cover.fall < 0) { cover.air = true; cover.vy = -HOP_V; sfx('jump'); } }
+// Runs on the sim clock (simStep) so the demo and the frame hook replay it exactly.
+function updateCover(dt) {
+  cover.t += dt; cover.idle += dt;
+  // the idle loop (6 s): carried, then (with no hold between) not carried, then walk home
+  if (!DEMO && !RM && cover.idle > 5) {
+    const lt = cover.t % 6, prev = (cover.t - dt) % 6;
+    const at = s => prev < s && lt >= s;
+    if (at(0.6)) coverLens(-1);
+    if (at(0.6 + CAPTION_T)) coverHop();
+    if (at(0.65 + CAPTION_T)) coverLens(1);
+    if (at(2.82)) cover.walk = 1;
+  }
+  if (cover.cap && cover.t - cover.cap.born > CAPTION_T + 0.2) cover.cap = null;
+  const bx0 = brickX();
+  const kb = cover.k;
+  cover.k += clamp(cover.kT - cover.k, -cover.rate * dt, cover.rate * dt);
+  if (Math.round(cover.k) !== Math.round(kb) || (Math.abs(cover.k - cover.kT) < 1e-9 && Math.abs(kb - cover.kT) > 1e-9)) sfx('click');
+  const bx1 = brickX();
+  if (cover.fall >= 0) { cover.fall += dt; cover.y += 500 * dt; if (cover.fall > 0.7) { coverReset(); cover.idle = 99; } return; }
+  if (!cover.air) cover.x += bx1 - bx0;                         // carried
+  else {
+    cover.vy += HOP_G * dt; cover.y += cover.vy * dt;
+    if (cover.y >= 0 && cover.vy > 0) {
+      const on = cover.x + COVER.RS > bx1 + 4 && cover.x < bx1 + COVER.BW - 4;
+      if (on) { cover.y = 0; cover.vy = 0; cover.air = false; sfx('land', 300); } else if (cover.y > 6) cover.fall = 0;
+    }
+  }
+  if (cover.walk && !cover.air) {
+    const home = bx1 + COVER.HOME, d = home - cover.x;
+    if (Math.abs(d) < 1) { cover.x = home; cover.walk = 0; } else cover.x += Math.sign(d) * Math.min(Math.abs(d), 110 * dt);
+  }
+  if (!cover.air && (cover.x + COVER.RS < bx1 + 2 || cover.x > bx1 + COVER.BW - 2)) cover.fall = 0;
+}
+// Depth shift under the lamp: each paper piece on the cover moves 2–6 px by how high it stands, away from the pointer.
+const lampShift = d => [-lamp.x * lamp.w * d, -lamp.y * lamp.w * d];
+function setBaseD(d) { const [sx, sy] = lampShift(d); ctx.setTransform(VIEW.S, 0, 0, VIEW.S, VIEW.offX + sx * VIEW.S, VIEW.offY + sy * VIEW.S); }
+const COVER_DEPTH = { numeral: 2, fan: 3, figure: 4, caps: 5, title: 6 };
+const COVER_RULES = ['Red carries you. Green kills. Blue is water.', 'Overlap all three to open the door.'];
+const CAPTION_BOX = [236, 424, 300, 30];
+function drawCover() {
+  const lc = PAPER.black, P = cover.pieces, S = VIEW.S, D = COVER_DEPTH, small = tooSmall();
+  const age = fx.cut && fx.cut.kind === 'title' ? fx.cut.age : 9;
+  setBaseD(D.numeral);
+  bigNumeral(String(best + 1), age, 0, { x: 34, top: 62, hgt: 420 });
+  // the title, cut from black paper
+  setBaseD(D.title);
+  ctx.fillStyle = lc; ctx.font = bs(84, 900); ctx.textAlign = 'right'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText('CHROMATIC DRIFT', 930, 128);
+  // the rules, typed under it on the field itself (no depth: type is printed, not cut)
+  setBase();
+  if (dropIn(3)) {
+    ctx.font = cp(18, 700); ctx.fillStyle = PH_LIGHT.run;                // an ink, not paper: the post pass gives it no shadow
+    COVER_RULES.forEach((t, i) => ctx.fillText(t, 930, 164 + i * 25));
+  }
+  const put = (c, x, y, d) => { const [sx, sy] = lampShift(d); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(c, Math.round(VIEW.offX + (x + sx) * S), Math.round(VIEW.offY + (y + sy) * S)); };
+  const u = [dropIn(0), dropIn(1), dropIn(2)];
+  // far side: a black block with the door fan standing on it
+  if (u[0]) {
+    const d = dropPx(u[0]);
+    put(P.block, 690, COVER.BY + d, D.fan);
+    put(P.pr, 740, COVER.BY - 150 + d, D.fan);
+    put(P.pg, 774, COVER.BY - 128 + d, D.fan);
+    put(P.pb, 808, COVER.BY - 108 + d, D.fan);
+    setBaseD(D.fan);
+    ctx.fillStyle = PAPER.white; ctx.fillRect(770, COVER.BY - 92 + d, 54, 92);
+    ctx.fillStyle = PAPER.black; ctx.beginPath(); ctx.arc(812, COVER.BY - 44 + d, 4, 0, Math.PI * 2); ctx.fill();
+    if (!small) {                                                    // teeth down in the gap (not on a phone: the note sits there)
+      // anchored: the teeth stand on a ground strip of black paper laid across the foot of the gap
+      ctx.fillStyle = PAPER.black; ctx.fillRect(574, 470 + d, 126, 10);
+      ctx.fillStyle = PAPER.green; ctx.beginPath();
+      for (let i = 0; i < 6; i++) { const x = 586 + i * 17; ctx.moveTo(x, 470 + d); ctx.lineTo(x + 8.5, 440 + d); ctx.lineTo(x + 17, 470 + d); }
+      ctx.fill();
+    }
+  }
+  const bx = brickX();
+  if (u[1]) put(P.brick, bx, COVER.BY + dropPx(u[1]), D.figure);
+  setBaseD(D.figure);
+  // phantoms: brick 12' at the next stop both ways, 10' only while grounded (dash-dot, in the ochre field's phantom inks)
+  const turning = Math.abs(cover.kT - cover.k) > 1e-4;
+  let dir = turning ? Math.sign(cover.kT - cover.k) : cover.dir;
+  if (stopToward(dir, cover.k, -2, 2) === null) dir = -dir;
+  const strongK = stopToward(dir, cover.k, -2, 2), faintK = stopToward(-dir, cover.k, -2, 2);
+  const furn = dropIn(3);
+  if (furn) for (const [kk, al, lw] of [[faintK, PH_FAINT_A, PH_FAINT_W], [strongK, 1, PH_STRONG_W]]) {
+    if (kk === null) continue;
+    ctx.globalAlpha = al * furn;
+    ctx.beginPath(); ctx.rect(brickX(kk) + lw / 2, COVER.BY + lw / 2, COVER.BW - lw, COVER.BH - lw);
+    phStroke(ctx, [null], PH_LIGHT.red, lw, JPX(PH_KEY_W));
+    ctx.lineWidth = lw;
+    if (!cover.air && cover.fall < 0) {
+      ctx.strokeStyle = PH_LIGHT.run; ctx.setLineDash(PH_DASH_RUN);
+      ctx.strokeRect(cover.x + (brickX(kk) - bx) + lw / 2, COVER.BY - COVER.RS + cover.y + lw / 2, COVER.RS - lw, COVER.RS - lw);
+    }
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+  }
+  const rx = cover.x, ry = COVER.BY - COVER.RS + cover.y;
+  if (u[1]) drawRunner(false, rx, ry, COVER.RS, 1);
+  if (furn && cover.air && cover.y < -6) dimension(rx + COVER.RS + 10, ry + COVER.RS, COVER.BY, lc);
+  const cap = furn ? drawCaption(lc) : null;
+  if (furn) {
+    const labels = [], a10 = [rx + COVER.RS + 1, ry + 6], a12 = [bx + 30, COVER.BY];
+    const s12 = strongK !== null ? [brickX(strongK) + (dir < 0 ? COVER.BW - 30 : 30), COVER.BY] : null;
+    const s10 = strongK !== null && !cover.air ? [rx + (brickX(strongK) - bx) + (dir < 0 ? COVER.RS + 1 : -1), ry + 6] : null;
+    const away = (a, b) => a && b ? norm(a[0] - b[0], a[1] - b[1]) : null;
+    labels.push({ key: 'c10', txt: '10', x: a10[0], y: a10[1], away: away(a10, s10) || [1, -1], col: lc, size: 30 });
+    labels.push({ key: 'c12', txt: '12', x: a12[0], y: a12[1], away: [-1, 0.2], col: lc, size: 30 });
+    if (s10) labels.push({ key: "c10'", txt: "10′", x: s10[0], y: s10[1], away: away(s10, a10), col: lc, size: 30 });
+    if (s12) labels.push({ key: "c12'", txt: "12′", x: s12[0], y: s12[1], away: [dir < 0 ? 1 : -1, 0.6], col: lc, size: 30 });
+    const obst = [[rx - 3, ry - 3, COVER.RS + 6, COVER.RS + 6], [bx, COVER.BY, COVER.BW, COVER.BH], [380, 40, 560, 100], [430, 140, 510, 58]];
+    // the caption's place is kept clear whether or not it is showing, so no numeral jumps when it arrives
+    obst.push(CAPTION_BOX, [690, COVER.BY - 150, 250, COVER.BH + 150], [574, 440, 126, 40]);
+    if (!small) obst.push([440, 490, 494, 32]);
+    for (const kk of [strongK, faintK]) if (kk !== null) {
+      obst.push([brickX(kk), COVER.BY, COVER.BW, COVER.BH]);
+      if (!cover.air && cover.fall < 0) obst.push([rx + brickX(kk) - bx, ry, COVER.RS, COVER.RS]);
+    }
+    if (small) obst.push([408, 440, 526, 92]);
+    placeLabels(labels, obst, [8, 8, CW - 8, CH - 8], { unit: 1.5 });
+    if (!small) {
+      setBaseD(D.caps);
+      keyCaps([['Q', 'E'], 'LENS', ['A', 'D'], 'MOVE', ['W'], 'JUMP', ['SPACE'], 'BEGIN', ['ESC'], 'SHEETS'], 930, 506, lc);
+    }
+  }
+  setBase();
+  if (furn && small) drawKeyboardNote();                             // last: above all the art
+}
+// The staged pair's caption: it arrives on the signature curve and leaves on power2.in, 900 ms in all.
+function drawCaption(col) {
+  const c = cover.cap; if (!c) return null;
+  const a = cover.t - c.born; if (a < 0 || a > CAPTION_T) return null;
+  const inU = RM ? 1 : SIG(a / 0.12), out = RM ? 0 : clamp((a - (CAPTION_T - 0.12)) / 0.12, 0, 1), e = out * out;
+  const [x, y] = CAPTION_BOX;
+  ctx.save(); ctx.globalAlpha = 1 - e;
+  ctx.font = bs(22, 800); ctx.fillStyle = col; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText(c.txt, x, y + 22 - 8 * (1 - inU) - 6 * e);
+  ctx.restore();
+  return CAPTION_BOX;
+}
+// Key hints as cut-paper caps; letters follow the player's keyboard layout (K()).
+function keyCaps(items, right, y, col, capPaper = PAPER.cream, capInk = PAPER.black) {
+  ctx.font = bs(20, 800); ctx.textBaseline = 'middle';
+  const parts = [];
+  for (const it of items) {
+    if (Array.isArray(it)) for (const kk of it) { const t = kk.length === 1 ? K('Key' + kk) : kk; parts.push({ cap: true, t, w: Math.max(26, ctx.measureText(t).width + 14) }); }
+    else parts.push({ cap: false, t: it, w: ctx.measureText(it).width + 22 });
+  }
+  let x = right - parts.reduce((s, q) => s + q.w + 6, 0);
+  for (const q of parts) {
+    if (q.cap) { ctx.fillStyle = capPaper; ctx.fillRect(x, y - 14, q.w, 28); ctx.fillStyle = capInk; ctx.textAlign = 'center'; ctx.fillText(q.t, x + q.w / 2, y + 1); }
+    else { ctx.fillStyle = col; ctx.textAlign = 'left'; ctx.fillText(q.t, x + 6, y + 1); }
+    x += q.w + 6;
+  }
+}
+const CHIP_DARK = '#1a1a1a';
+// Set the largest font (down to min) at which txt fits in maxW.
+function fitFont(txt, maxW, size, weight, min = 11) {
+  let s = size;
+  for (; s > min; s -= 0.5) { ctx.font = bs(s, weight); if (ctx.measureText(txt).width <= maxW) break; }
+  ctx.font = bs(s, weight); return s;
+}
+function chip(x, y, w, h, ink, txt, al = 1) {
+  ctx.globalAlpha = al; ctx.fillStyle = ink; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = lightInk(ink) ? CHIP_DARK : PAPER.cream;          // on the orange swatch the numeral is near-black ctx.font = bs(h * 0.86, 900); ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText(txt, x + w / 2, y + h - 4); ctx.globalAlpha = 1;
 }
 
-// Audio: an A-major pad whose red/blue voices detune with lens misalignment, plus sfx.
-let ac = null, master = null, voices = [], muted = false, noiseBuf = null;
-function initAudio() {
+// The claims, written from what the player did on each sheet (see `track`): one mechanic clause and one
+// verdict clause, from a small grammar. A clean sheet reads "wherein no alternative embodiment was required".
+const DESC = [
+  'is a view of the lens bringing the three parts of door 18 into register',
+  'shows the far ledge slid under the runner in mid-air',
+  'shows red and blue drifting in opposite directions, with water 16',
+  'shows a lens of limited travel, wound back while standing',
+  'shows water 16 carried across a pit',
+  'is a section through the lens acting up and down',
+  'shows the floor brought up to catch a falling runner',
+  'shows the water raised by sinking the red',
+  'shows headroom made beneath the teeth',
+  'shows every part in combination',
+];
+const NUMW = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve'];
+const nw = (n, one, many) => `${n < NUMW.length ? NUMW[n] : n} ${n === 1 ? one : many}`;
+// Each phrasing of a clause is used at most twice in the ten: the n-th use of a clause type takes variant
+// floor(n / 2), five variants each, every one filled from the run's own numbers. The connective rotates the same way
+// ("wherein" twice, then "in which", "whereby", "characterised in that", "such that"), and the verdict is an absolute
+// clause, so no "wherein" stands more than twice in the filing.
+const CONN = ['wherein', 'in which', 'whereby', 'characterised in that', 'such that'];
+const N = n => nw(n, 'stop', 'stops');
+const MECH = {
+  airH: c => [`12 was slid ${N(c.air)} under 10 in mid-air`, `12 was brought ${N(c.air)} beneath 10 while 10 was in the air`,
+    `10, being airborne, was met by 12 after ${N(c.air)}`, `the far part of 12 travelled ${N(c.air)} to meet 10 in flight`,
+    `12 crossed ${N(c.air)} beneath an unsupported 10`],
+  airV: (c, w) => [`12 was ${w} ${N(c.air)} beneath 10 in mid-air`, `10, in the air, was met by 12 ${w} ${N(c.air)}`,
+    `12 was ${w} ${N(c.air)} while 10 was unsupported`, `12 was ${w} ${N(c.air)} between the take-off and the landing of 10`,
+    `${N(c.air)} of lens 20 ${w === 'raised' ? 'raised' : 'sank'} 12 beneath 10 in flight`],
+  swim: (c, s) => [`10 swam ${s} seconds in water 16`, `water 16 bore 10 for ${s} seconds`, `10 was held ${s} seconds in water 16`,
+    `10 remained ${s} seconds within water 16`, `10 crossed in water 16, swimming ${s} seconds`],
+  carryH: c => [`10 rode on 12 for ${N(c.carry)}`, `10, standing on 12, was carried ${N(c.carry)}`, `12 carried 10 through ${N(c.carry)}`,
+    `10 was conveyed ${N(c.carry)} on 12`, `10 stood on 12 for ${N(c.carry)} of lens 20`],
+  carryV: (c, w) => [`10, standing on 12, was ${w} ${N(c.carry)}`, `12 ${w === 'raised' ? 'lifted' : 'lowered'} 10 ${N(c.carry)}`,
+    `10 was ${w} ${N(c.carry)} on 12`, `10 rode 12 ${w === 'raised' ? 'up' : 'down'} ${N(c.carry)}`, `10 stood on 12 while it was ${w} ${N(c.carry)}`],
+  reg: () => ['door 18 was brought into register by lens 20', 'lens 20 alone brought door 18 into register',
+    'door 18 was registered without carrying 10', 'the three parts of door 18 were registered by lens 20', 'lens 20 closed door 18 without moving 10'],
+};
+// the verdict, long (an absolute clause for the grant) and short (the Brief's terse line)
+const VERD = {
+  clean: (c, par) => [['no alternative embodiment being required', 'no alternative embodiment was required'],
+    [`the lens being turned no more than the reference ${N(par)}`, `${c.steps} stops, as the reference`],
+    ['the first attempt being allowed as filed', 'allowed as filed'],
+    [`the sheet being crossed in ${c.t.toFixed(1)} seconds without a prior attempt`, `first attempt, ${c.t.toFixed(1)} seconds`],
+    [`${N(c.steps)} sufficing, as in the reference embodiment`, 'nothing anticipated']],
+  extra: (c, par) => [[`the lens being turned ${N(c.steps)} where ${NUMW[par] || par} would suffice`, `${c.steps} stops where ${par} suffice`],
+    [`${N(c.steps - par)} more than the reference embodiment being used`, `${c.steps - par} over the reference`],
+    [`${c.steps} stops being spent on a ${par}-stop sheet`, `${c.steps} stops for ${par}`],
+    [`the reference embodiment being exceeded by ${N(c.steps - par)}`, `exceeds the reference by ${c.steps - par}`],
+    [`the lens being worked ${N(c.steps)}, ${NUMW[par] || par} sufficing`, `worked ${c.steps}, ${par} suffice`]],
+  only: (c, par) => [[`the lens being turned only ${N(c.steps)}, after ${nw(c.d, 'anticipated attempt', 'anticipated attempts')}`, `only ${c.steps} stops, ${c.d} anticipated`],
+    [`${nw(c.d, 'prior attempt', 'prior attempts')} being anticipated before ${N(c.steps)} sufficed`, `${c.d} anticipated, then ${c.steps} stops`],
+    [`the reference ${NUMW[par] || par} stops being met at attempt ${c.d + 1}`, `reference met at attempt ${c.d + 1}`],
+    [`the sheet being allowed at attempt ${c.d + 1}, in ${N(c.steps)}`, `allowed at attempt ${c.d + 1}`],
+    [`${N(c.steps)} sufficing once ${nw(c.d, 'attempt was', 'attempts were')} anticipated`, `${c.steps} stops after ${c.d} cited`]],
+  ant: c => [[`${nw(c.d, 'prior attempt being', 'prior attempts being')} anticipated`, `${c.d} anticipated`],
+    [`the sheet being allowed at attempt ${c.d + 1}`, `allowed at attempt ${c.d + 1}`],
+    [`${nw(c.d, 'earlier embodiment', 'earlier embodiments')} being cited as prior art`, `${c.d} cited as prior art`],
+    [`the claim being allowed over ${nw(c.d, 'anticipated attempt', 'anticipated attempts')}`, `allowed over ${c.d} anticipated`],
+    [`${nw(c.d, 'attempt', 'attempts')} being circled as anticipated`, `${c.d} circled`]],
+};
+function claimParts(i) {
+  const used = {}, take = key => { const n = used[key] || 0; used[key] = n + 1; return Math.floor(n / 2) % 5; };
+  let out = null;
+  for (let j = 0; j <= i; j++) {
+    const c = filing[j]; if (!c) continue;
+    const v = LEVELS[j].axis === 'y', par = PAR[j];
+    let a;
+    if (c.air > 0) a = v ? MECH.airV(c, c.airUp * 2 >= c.air ? 'raised' : 'sunk')[take('airV')] : MECH.airH(c)[take('airH')];
+    else if (c.swim >= 0.5) a = MECH.swim(c, c.swim.toFixed(1))[take('swim')];
+    else if (c.carry > 0) a = v ? MECH.carryV(c, c.carryUp * 2 >= c.carry ? 'raised' : 'lowered')[take('carryV')] : MECH.carryH(c)[take('carryH')];
+    else a = MECH.reg()[take('reg')];
+    const vt = c.d === 0 ? (c.steps <= par ? 'clean' : 'extra') : (c.steps <= par ? 'only' : 'ant');
+    const [b, bs2] = VERD[vt](c, par)[take(vt)];
+    if (j === i) out = { a, b, bs2, conn: CONN[Math.floor(i / 2) % CONN.length] };
+  }
+  return out;
+}
+function claimBody(i, short = false) {
+  const q = claimParts(i); if (!q) return null;
+  // The Brief's one line: the mechanic and a terse verdict. The grant's claim: the whole sentence.
+  if (short) return `${q.conn} ${q.a}; ${q.bs2}.`;
+  return `${i === 0 ? 'A method of crossing a drawing sheet' : 'The method of claim 1'}, ${q.conn} ${q.a}, ${q.b}.`;
+}
+const filed = () => filing.filter(Boolean);
+const hash01 = x => { const v = Math.sin(x * 127.1 + 311.7) * 43758.5453; return v - Math.floor(v); };
+const mmss = t => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+
+// Esc: the Brief Description of the Drawings. One line per sheet; cleared sheets carry the player's claim.
+const brief = { from: 'title', sel: 0, hover: -1, rows: [] };
+// Rows of 38 px; the typed sentence column runs from x 196 and stops at 815, 19 px (28 px at 1440 wide) before the ALLOWED tab.
+const BRIEF_Y = 116, BRIEF_ROW = 38, BRIEF_X0 = 196, BRIEF_X1 = 815, BRIEF_FS = 13, LONG_LH = 1.4;
+// Word-wrap in the current font (no shrinking: long text wraps).
+function wrapText(txt, maxW) {
+  const out = []; let line = '';
+  for (const w of txt.split(' ')) {
+    const t = line ? `${line} ${w}` : w;
+    if (line && ctx.measureText(t).width > maxW) { out.push(line); line = w; } else line = t;
+  }
+  if (line) out.push(line);
+  return out;
+}
+// A Brief sentence that needs two lines breaks after its semicolon (the mechanic, then the verdict) when both halves fit.
+function briefLines(txt, maxW) {
+  if (ctx.measureText(txt).width <= maxW) return [txt];
+  const i = txt.indexOf('; ');
+  if (i > 0) { const a = txt.slice(0, i + 1), b = txt.slice(i + 2); if (ctx.measureText(a).width <= maxW && ctx.measureText(b).width <= maxW) return [a, b]; }
+  return wrapText(txt, maxW);
+}
+function openBrief() {
+  snapCard('in');
+  brief.from = state; brief.sel = state === 'title' ? best : li; brief.hover = -1;
+  if (state === 'title') coverReset();
+  state = 'brief'; keys.clear(); cut('brief'); updateText();
+  if (fx.esc) fx.cut.age = -ESC_DELAY;           // the page's own heading and rows start once its card is down
+}
+function closeBrief() {
+  snapCard('out');
+  state = brief.from; keys.clear();
+  if (state === 'title') { coverReset(); cut('title'); } else cut('fast');
+  updateText();
+}
+function openSheet(i) {
+  jumpTo(i, i => { if (brief.from === 'title' || brief.from === 'end' || !L) startGame(i); else loadLevel(i); });
+}
+function drawBrief() {
+  setBase();
+  const age = fx.cut && fx.cut.kind === 'brief' ? fx.cut.age : 9, s = slam(age);
+  ctx.fillStyle = PAPER.black; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  // the heading is stamped in with the rows, from the card's first frame (never an empty page)
+  if (RM || age >= 0) {
+    const hs = RM ? 1 : 1 + 0.12 * (1 - slam(age, 0.09, 0.03));
+    ctx.save(); ctx.translate(48, 82); ctx.scale(hs, hs);
+    ctx.font = bs(46, 900); ctx.fillText('BRIEF DESCRIPTION OF THE DRAWINGS', 0, 0); ctx.restore();
+    ctx.fillRect(48, 98, 864 * s, 4);
+  }
+  const cur = brief.from === 'title' || brief.from === 'end' || !L ? -1 : li;
+  const lh = BRIEF_FS * LONG_LH;
+  for (let i = 0; i < LEVELS.length; i++) {
+    // each row is stamped in: it arrives scaled up and settles on the signature curve, 25 ms after the one above,
+    // the first with the heading
+    const t0 = RM ? 0 : BRIEF_ROW_T0 + i * BRIEF_STAGGER, a = age - t0;
+    if (!RM && a < 0) continue;
+    const sc = RM ? 1 : 1 + 0.22 * (1 - slam(a, 0.09, 0.03));
+    const y = BRIEF_Y + i * BRIEF_ROW, on = i === brief.sel || i === brief.hover;
+    ctx.save(); ctx.translate(480, y + 15.5); ctx.scale(sc, sc); ctx.translate(-480, -(y + 15.5));
+    const claim = claimBody(i, true), reached = i <= best || !!claim, al = reached ? 1 : 0.42;
+    chip(48, y, 44, 31, INK[i % 4], String(i + 1), al);           // the swatches stand in one column; selection is the underline
+    if (i === cur) { ctx.fillStyle = PAPER.black; tri(40, y + 15.5, 0, 14); }
+    ctx.globalAlpha = al; ctx.fillStyle = PAPER.black; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.font = bs(25, 900); ctx.fillText(LEVELS[i].name, 108, y + 26);
+    // the sentence, typed: one or two lines, centred on the row
+    const txt = claim || (reached ? DESC[i] : '[pending]');
+    ctx.font = cp(BRIEF_FS, 400); ctx.fillStyle = TEXT_DARK;          // typed ink: no paper shadow
+    const lines = briefLines(txt, BRIEF_X1 - BRIEF_X0), top = y + 15.5 - lines.length * lh / 2;
+    lines.forEach((t, j) => ctx.fillText(t, BRIEF_X0, top + j * lh + lh / 2 + BRIEF_FS * 0.33));
+    // the selected row: its name underlined (a wrapped sentence keeps clear of the row below)
+    if (on) { ctx.font = bs(25, 900); ctx.fillStyle = PAPER.black; ctx.fillRect(108, y + 31, ctx.measureText(LEVELS[i].name).width, 3); }
+    ctx.globalAlpha = 1;
+    if (claim) {
+      // each tab stamped by hand: seeded per row, -3..+3 degrees and 0-4 px of jitter
+      const r1 = hash01(i * 7.31 + 1.7), r2 = hash01(i * 3.17 + 9.1), r3 = hash01(i * 5.53 + 4.2);
+      ctx.save(); ctx.translate(872 + (r2 * 2 - 1) * JPX(4) / Math.SQRT2, y + 15 + (r3 * 2 - 1) * JPX(4) / Math.SQRT2); ctx.rotate((r1 * 6 - 3) * Math.PI / 180);
+      ctx.fillStyle = PAPER.red; ctx.fillRect(-38, -11, 76, 22);
+      ctx.fillStyle = PAPER.white; ctx.font = bs(15, 900); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('ALLOWED', 0, 1);
+      ctx.restore(); ctx.textBaseline = 'alphabetic';
+    }
+    ctx.restore();
+  }
+  if (dropIn(3)) keyCaps([[levelKeys()], 'SHEET', ['ESC'], 'RETURN', ['C'], 'COVER'], 912, 518, PAPER.black, PAPER.black, PAPER.cream);
+}
+function briefRowAt(bx, by) {
+  const i = Math.floor((by - BRIEF_Y + 3) / BRIEF_ROW);
+  return bx > 40 && bx < 920 && i >= 0 && i < LEVELS.length && by - BRIEF_Y - i * BRIEF_ROW < 36 ? i : -1;
+}
+
+// The end: LETTERS PATENT on the fifth ink, the ten claims typed one per beat, an embossed seal, the totals.
+const SAVE_BTN = [520, 488, 236, 40];
+function drawGrant(age, ui) {
+  setBase();
+  const s = RM ? 1 : slam(age, 0.12), cr = PAPER.cream, done = filed();
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = cr;
+  ctx.font = bs(88, 900); ctx.fillText('LETTERS PATENT', 40 - 760 * (1 - s), 96);
+  if (age >= (RM ? 0 : 0.2)) {
+    ctx.font = bs(20, 700);
+    ctx.fillText(`CHROMATIC DRIFT · ${nw(done.length, 'CLAIM', 'CLAIMS').toUpperCase()} ALLOWED ON TEN DRAWING SHEETS`, 42, 126);
+    ctx.fillStyle = PAPER.black; ctx.fillRect(40, 138, 880, 4);
+    ctx.fillStyle = cr; ctx.font = bs(19, 800); ctx.fillText('WHAT IS CLAIMED IS:', 40, 166);
+  }
+  // The claims, typed in two columns (x 40 and x 492, 428 wide), each wrapped with its number hanging in the margin.
+  const CL = grantLayout();
+  for (let i = 0; i < LEVELS.length; i++) {
+    if (!RM && age < GRANT_T0 + i * GRANT_DT) break;
+    const c = CL.claims[i];
+    ctx.globalAlpha = c.body ? 1 : 0.55; ctx.fillStyle = TEXT_LIGHT; ctx.font = cp(GRANT_FS, 400);   // typed ink: no shadow
+    ctx.textAlign = 'right'; ctx.fillText(`${i + 1}.`, c.x + GRANT_IND - 7, c.y);
+    ctx.textAlign = 'left'; c.lines.forEach((t, j) => ctx.fillText(t, c.x + GRANT_IND, c.y + j * CL.lh));
+    ctx.globalAlpha = 1;
+  }
+  const tSeal = RM ? 0 : GRANT_T0 + LEVELS.length * GRANT_DT + 0.1;
+  if (age >= tSeal) drawSeal(852, 76, 54, age - tSeal);
+  if (age >= tSeal) {
+    const tt = done.reduce((a, c) => a + c.t, 0), dd = done.reduce((a, c) => a + c.d, 0);
+    ctx.fillStyle = cr; ctx.textAlign = 'left';
+    ctx.font = bs(40, 900); ctx.fillText(mmss(tt), 40, 520);
+    const w1 = ctx.measureText(mmss(tt)).width;
+    ctx.fillText(String(dd), 40 + w1 + 46, 520);
+    const w2 = ctx.measureText(String(dd)).width;
+    ctx.font = bs(15, 800); ctx.fillText('TOTAL TIME', 40, 482); ctx.fillText(dd === 1 ? 'ATTEMPT ANTICIPATED' : 'ATTEMPTS ANTICIPATED', 40 + w1 + 46, 482);
+    if (ui) {
+      const [bx, by, bw, bh] = SAVE_BTN, hot = brief.hover === 99;
+      lift(bx + bw / 2, by + bh / 2, bw / 2, bh / 2, 0, hot ? 5 : 2);
+      setBase();
+      ctx.fillStyle = cr; ctx.fillRect(bx - (hot ? 2 : 0), by - (hot ? 2 : 0), bw, bh);
+      ctx.fillStyle = PAPER.black; ctx.fillRect(bx + 8 - (hot ? 2 : 0), by + 8 - (hot ? 2 : 0), 24, 24);
+      ctx.fillStyle = cr; ctx.font = bs(18, 800); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(K('KeyS'), bx + 20 - (hot ? 2 : 0), by + 21 - (hot ? 2 : 0));
+      ctx.fillStyle = PAPER.black; ctx.font = bs(23, 900); ctx.fillText('SAVE THE PATENT', bx + 20 + (bw - 20) / 2 - (hot ? 2 : 0), by + 21 - (hot ? 2 : 0));
+      ctx.textBaseline = 'alphabetic';
+      keyCaps([['R'], 'NEW FILING'], 920, 508, cr);
+    } else {
+      ctx.fillStyle = cr; ctx.font = bs(15, 700); ctx.textAlign = 'right';
+      ctx.fillText('GITHUB GAME OFF 2026 · THEME: SHIFT', 920, 516);
+    }
+  }
+}
+const GRANT_FS = 12, GRANT_IND = 26, GRANT_COLS = [40, 492], GRANT_COLW = 428, GRANT_Y0 = 192, GRANT_YMAX = 466, GRANT_GAP = 5;
+// Wrap every claim and balance them, in order, over the two columns (the split that makes the taller column shortest).
+function grantLayout() {
+  ctx.font = cp(GRANT_FS, 400);
+  const wrapped = LEVELS.map((_, i) => {
+    const body = claimBody(i);
+    return { body, lines: wrapText(body || `(cancelled: FIG. ${i + 1} was not crossed in this filing)`, GRANT_COLW - GRANT_IND) };
+  });
+  const fit = lh => {
+    const hgt = (a, b) => wrapped.slice(a, b).reduce((s, c) => s + c.lines.length * lh, 0) + Math.max(0, b - a - 1) * GRANT_GAP;
+    let best = null;
+    for (let s = 1; s < wrapped.length; s++) { const m = Math.max(hgt(0, s), hgt(s, wrapped.length)); if (!best || m < best.m) best = { s, m }; }
+    return best;
+  };
+  // 1.4 leading; a filing long enough to overrun both columns closes up to 1.3 rather than shrink the type
+  let lh = GRANT_FS * LONG_LH, sp = fit(lh);
+  if (sp.m > GRANT_YMAX - GRANT_Y0 + lh) { lh = GRANT_FS * 1.3; sp = fit(lh); }
+  const claims = []; let y = GRANT_Y0;
+  wrapped.forEach((c, i) => {
+    if (i === sp.s) y = GRANT_Y0;
+    claims.push({ ...c, x: GRANT_COLS[i < sp.s ? 0 : 1], y });
+    y += c.lines.length * lh + GRANT_GAP;
+  });
+  return { claims, lh };
+}
+// The grant's seal: scalloped cream paper, a black ring, door 18's number, two red ribbon tails.
+function drawSeal(cx, cy, r, age) {
+  const s = RM ? 1 : 1 + 0.5 * (1 - slam(age, 0.1, 0.04));
+  lift(cx, cy, r * 0.8 * s, r * 0.8 * s, 0, RM ? 0 : (1 - SIG(clamp(age / 0.12, 0, 1))) * 14);
+  setBase(); ctx.save(); ctx.translate(cx, cy); ctx.scale(s, s);
+  ctx.fillStyle = PAPER.red;
+  for (const sd of [-1, 1]) {
+    ctx.save(); ctx.rotate(sd * 0.32);
+    ctx.beginPath(); ctx.moveTo(-13, 0); ctx.lineTo(13, 0); ctx.lineTo(13, r + 44); ctx.lineTo(0, r + 32); ctx.lineTo(-13, r + 44); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  ctx.fillStyle = PAPER.cream; ctx.beginPath();
+  const n = 26;
+  for (let i = 0; i <= n * 2; i++) { const a = i / (n * 2) * Math.PI * 2, rr = i % 2 ? r : r - 6; ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); }
+  ctx.fill();
+  ctx.fillStyle = PAPER.black; ctx.beginPath(); ctx.arc(0, 0, r - 13, 0, Math.PI * 2); ctx.arc(0, 0, r - 19, 0, Math.PI * 2, true); ctx.fill();
+  for (let i = 0; i < 18; i++) { const a = i / 18 * Math.PI * 2; ctx.beginPath(); ctx.arc(Math.cos(a) * (r - 27), Math.sin(a) * (r - 27), 2, 0, Math.PI * 2); ctx.fill(); }
+  ctx.font = bs(56, 900); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('18', 0, 3);
+  ctx.restore(); ctx.textBaseline = 'alphabetic';
+}
+// "Save the patent": the card redrawn at 1920x1080 without its buttons, as a PNG. Only ever on the player's click or key.
+function savePatent() {
+  const c = document.createElement('canvas'); c.width = 1920; c.height = 1080;
+  const x = c.getContext('2d', { alpha: false }), keep = { ...VIEW };
+  Object.assign(VIEW, { S: 2, offX: 0, offY: 0 });
+  ctx = x;
+  try {
+    x.fillStyle = INK5; x.fillRect(0, 0, c.width, c.height);
+    drawGrant(99, false);
+  } finally { ctx = ctx0; Object.assign(VIEW, keep); }
+  sfx('thump');
+  c.toBlob(b => {
+    if (!b) return;
+    const url = URL.createObjectURL(b), a = document.createElement('a');
+    a.href = url; a.download = 'chromatic-drift-letters-patent.png';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }, 'image/png');
+}
+function newFiling() {
+  filing = new Array(LEVELS.length).fill(null); saveFiling();
+  startGame(0);
+}
+function drawMuteMark() {
+  setBase();
+  // on a sheet the rail's foot holds the controls, so the mark stands just above them
+  const play = L && (state === 'play' || state === 'dead' || state === 'win'), x = play ? TB.x : 30, y = play ? 444 : 500;
+  ctx.fillStyle = PAPER.black;
+  ctx.fillRect(x, y + 6, 8, 12);
+  ctx.beginPath(); ctx.moveTo(x + 8, y + 6); ctx.lineTo(x + 18, y - 1); ctx.lineTo(x + 18, y + 25); ctx.lineTo(x + 8, y + 18); ctx.fill();
+  ctx.fillStyle = PAPER.red; strip(x + 24, y + 3, x + 38, y + 21, 3.2, 3.2); strip(x + 38, y + 3, x + 24, y + 21, 3.2, 3.2);
+}
+// Touch-only or small screens: the cover says, on its own paper, that this filing needs a keyboard.
+// Drawn last, over all the art, in the band the keycaps use on a desktop (the cover's teeth are left out on a phone).
+function drawKeyboardNote() {
+  const pad = 20, w = 520, h = 84, x = 930 - w / 2, y = 486;
+  lift(x, y, w / 2, h / 2, -0.015, 3);
+  setBase(); ctx.save(); ctx.translate(x, y); ctx.rotate(-0.015);
+  ctx.fillStyle = PAPER.black; ctx.fillRect(-w / 2, -h / 2, w, h);
+  ctx.fillStyle = PAPER.cream; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.font = bs(34, 900); ctx.fillText('THIS FILING NEEDS A KEYBOARD', -w / 2 + pad, -h / 2 + pad + 24);
+  ctx.font = bs(20, 700); ctx.fillText(`OPEN IT ON A COMPUTER: THE LENS TURNS WITH ${K('KeyQ')} / ${K('KeyE')} OR THE WHEEL`, -w / 2 + pad, h / 2 - pad);
+  ctx.restore();
+}
+
+// WebGL2 post pass, B's paper: a static seeded paper texture per piece, a soft layered drop shadow
+// 2 px down-right (a light box), a flat grade (saturation 1.0), no split and no lens (print has
+// none), and a 1-frame +-1 px gate jump on each cut.
+// The paper is static, so its noise (edge-roughness mask, fibre, mottling) is baked once into a
+// texture at the viewport's size; each frame only reads it.
+const glc = document.getElementById('gl');
+let G = null;
+const BAKE = `#version 300 es
+precision highp float;
+uniform vec2 uSize, uOrigin;
+uniform float uS;
+out vec4 o;
+${document.getElementById('glsl-lib').textContent}
+void main() {
+  vec2 px = vec2(gl_FragCoord.x, uSize.y - gl_FragCoord.y);
+  vec2 lp = (px - uOrigin) / uS;
+  // edge-roughness mask: where the frame is read from, in logical px (|d| < 0.8)
+  vec2 d = vec2(gradientNoise(lp * 0.13), gradientNoise(lp * 0.13 + vec2(41.3, 7.9))) * 0.55
+         + vec2(gradientNoise(lp * 0.71 + 7.7), gradientNoise(lp * 0.71 + 19.1)) * 0.22;
+  float fine = gradientNoise(lp * vec2(0.9, 0.16) + 3.1);      // long fibres
+  float mott = fbm(lp * 0.035 + 11.0, 3);                      // cloudy formation
+  o = vec4(d * 0.5 + 0.5, fine * 0.5 + 0.5, mott * 0.5 + 0.5);
+}`;
+const FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uFrame, uPaper;
+uniform vec2 uSize, uOrigin, uGate, uRed, uBlue;
+uniform float uS, uSeed;
+uniform vec3 uPal[8];
+uniform int uMode, uNL;
+uniform vec4 uLR[3];   // lifted paper: centre, half size (device px)
+uniform vec4 uLA[3];   // its angle, how far it stands off the sheet, its shadow's blur (device px; 0: from the lift)
+uniform vec4 uChip;    // the rail's carry chip (device px): one piece of paper, its type flush with it
+uniform vec3 uUnder;   // the next sheet's ink, while a finished sheet is pulled off it
+uniform float uHasUnder;
+uniform vec3 uPh[16];  // phantom and typed-text inks (and the phantoms' 80% blends): ink on the sheet, never paper
+uniform int uNPh;
+uniform vec2 uLamp;    // the pointer, as the rostrum lamp (device px), and how much it counts (0 at rest / reduced motion)
+uniform float uLampW;
+out vec4 o;
+// Every piece is one flat paper colour, so the colour says which piece a pixel is, and the
+// palette order is the stacking order: field, numeral cream, green, red, blue, white, black; the eighth entry is the
+// title card's field-tinted paper, which lies just above the field (depth 0.6).
+int cls(vec3 c) {
+  int b = 0; float bd = 1e9;
+  for (int i = 0; i < 8; i++) { vec3 d = c - uPal[i]; float e = dot(d, d); if (e < bd) { bd = e; b = i; } }
+  if (uHasUnder > 0.5) { vec3 d = c - uUnder; if (dot(d, d) < bd) b = 0; }
+  for (int i = 0; i < 16; i++) { if (i >= uNPh) break; vec3 d = c - uPh[i]; if (dot(d, d) < bd) { bd = dot(d, d); b = 8; } }
+  return b;
+}
+vec3 tap(vec2 px) { return texture(uFrame, px / uSize).rgb; }
+float depthOf(int id) { return id == 7 ? 0.6 : id == 8 ? 0.0 : float(id); }
+// Inside the carry chip everything is the chip (paper over the field, its type printed on it, never under it).
+float depthP(vec2 p, int id) {
+  return (p.x >= uChip.x && p.y >= uChip.y && p.x <= uChip.z && p.y <= uChip.w) ? 6.5 : depthOf(id);
+}
+float depthAt(vec2 px) { return depthP(px, cls(tap(px))); }
+// 4 shadow taps (a triangle around the centre) and 3 ambient taps: 8 palette lookups per pixel in all.
+const vec2 TAPS[4] = vec2[4](vec2(0.0), vec2(1.0, 0.0), vec2(-0.5, 0.87), vec2(-0.5, -0.87));
+const vec2 AMB[3] = vec2[3](vec2(0.5, 0.87), vec2(0.5, -0.87), vec2(-1.0, 0.0));
+void main() {
+  vec2 px = vec2(gl_FragCoord.x, uSize.y - gl_FragCoord.y) - uGate;
+  if (uMode == 1) { o = vec4(tap(px), 1.0); return; }
+  vec2 d = (texture(uPaper, px / uSize).rg - 0.5) * 2.0;
+  vec2 sp = px + d * uS;
+  vec3 col = tap(sp);
+  int id = cls(col);
+  float dep = depthP(sp, id);
+  // Each kind of paper reads its own patch of the sheet (seeded per FIG.), and the moving
+  // layers' patch rides with them. Mirrored repeat keeps the lookup seamless.
+  vec2 lp = id == 3 ? px - uRed : id == 4 ? px - uBlue : px;
+  vec2 pz = texture(uPaper, (lp + vec2(173.0, 91.0) * float(id == 8 ? 0 : id) + vec2(311.0, 157.0) * uSeed) / uSize).ba * 2.0 - 1.0;
+  float f = pz.x * 0.6 + pz.y * 0.3;
+  col = col * (1.0 + 0.035 * f) + 0.01 * f;
+  float sh = 0.0, amb = 0.0;
+  // The lamp: every piece's shadow falls away from the pointer, longer the further the piece is from it (1–4 px).
+  vec2 lv = (px - uLamp) / uSize.y * 7.0;
+  float ll = length(lv);
+  lv *= clamp(ll, 1.0, 4.0) / max(ll, 1e-3);
+  vec2 off = mix(vec2(2.0), lv, uLampW) * uS, off2 = mix(vec2(3.5, 4.5), lv * 2.0, uLampW) * uS;
+  for (int i = 0; i < 4; i++) {
+    float dd = depthAt(sp - off + TAPS[i] * 1.1 * uS) - dep;
+    sh += dd > 0.5 ? 0.85 + 0.05 * min(dd, 3.0) : 0.0;
+  }
+  for (int i = 0; i < 3; i++) amb += depthAt(sp - off2 + AMB[i] * 3.0 * uS) - dep > 0.5 ? 1.0 : 0.0;
+  col *= 1.0 - 0.30 * sh / 4.0 - 0.08 * amb / 3.0;
+  // Paper lifted off the light box casts a softer, wider shadow the higher it stands.
+  for (int i = 0; i < 3; i++) {
+    if (i >= uNL) break;
+    vec2 c = uLR[i].xy, hs = uLR[i].zw; float a = uLA[i].x, l = uLA[i].y;
+    mat2 R = mat2(cos(a), -sin(a), sin(a), cos(a));
+    vec2 ld = mix(vec2(0.6, 1.0), normalize(c - uLamp + vec2(0.001)) * 1.166, uLampW);
+    vec2 qp = R * (px - c), qs = R * (px - c - ld * l);
+    vec2 dp = abs(qp) - hs, ds = abs(qs) - hs;
+    float inPiece = max(dp.x, dp.y);
+    float sd = length(max(ds, 0.0)) + min(max(ds.x, ds.y), 0.0), blur = uLA[i].z > 0.0 ? uLA[i].z : 1.5 + 0.9 * l;
+    float shade = (1.0 - smoothstep(-0.35 * blur, blur, sd)) * step(0.0, inPiece) * smoothstep(0.0, 3.0, l);
+    col *= 1.0 - 0.34 * shade;
+  }
+  o = vec4(col, 1.0);
+}`;
+const VERT = `#version 300 es
+void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`;
+const hex3 = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
+function initGL() {
+  if (GL_OFF) return null;
+  let gl = null;
+  try { gl = glc.getContext('webgl2', { antialias: false, alpha: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: FRAMES, powerPreference: 'high-performance' }); } catch (e) { gl = null; }
+  if (!gl) return null;
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); return null; } return s; };
+  const program = (fsrc, names) => {
+    const vs = sh(gl.VERTEX_SHADER, VERT), fs = sh(gl.FRAGMENT_SHADER, fsrc);
+    if (!vs || !fs) return null;
+    const p = gl.createProgram(); gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { console.error(gl.getProgramInfoLog(p)); return null; }
+    const u = {}; for (const n of names) u[n] = gl.getUniformLocation(p, n);
+    return { p, u };
+  };
+  const post = program(FRAG, ['uFrame', 'uPaper', 'uSize', 'uOrigin', 'uGate', 'uRed', 'uBlue', 'uS', 'uSeed', 'uPal', 'uMode', 'uNL', 'uLR', 'uLA', 'uUnder', 'uHasUnder', 'uPh', 'uNPh', 'uLamp', 'uLampW', 'uChip']);
+  const bake = program(BAKE, ['uSize', 'uOrigin', 'uS']);
+  if (!post || !bake) return null;
+  const mkTex = wrap => {
+    const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+    return t;
+  };
+  const tex = mkTex(gl.CLAMP_TO_EDGE), paper = mkTex(gl.MIRRORED_REPEAT), fbo = gl.createFramebuffer();
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  const vao = gl.createVertexArray();
+  document.documentElement.dataset.gl = 'on';
+  return { gl, post, bake, tex, paper, fbo, vao, ms: [], tw: 0, th: 0, pw: 0, ph: 0 };
+}
+function bakePaper() {
+  const { gl } = G, w = cv.width, h = cv.height;
+  gl.bindTexture(gl.TEXTURE_2D, G.paper);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, G.fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, G.paper, 0);
+  gl.viewport(0, 0, w, h);
+  gl.useProgram(G.bake.p); gl.bindVertexArray(G.vao);
+  gl.uniform2f(G.bake.u.uSize, w, h); gl.uniform2f(G.bake.u.uOrigin, VIEW.offX, VIEW.offY); gl.uniform1f(G.bake.u.uS, VIEW.S);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  G.pw = w; G.ph = h;
+}
+function renderGL() {
+  if (!G) return;
+  const { gl } = G, u = G.post.u, t0 = performance.now();
+  if (glc.width !== cv.width || glc.height !== cv.height) { glc.width = cv.width; glc.height = cv.height; }
+  if (!POST_OFF && (G.pw !== cv.width || G.ph !== cv.height)) bakePaper();
+  gl.viewport(0, 0, glc.width, glc.height);
+  gl.useProgram(G.post.p); gl.bindVertexArray(G.vao);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, G.paper);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, G.tex);
+  if (G.tw !== cv.width || G.th !== cv.height) { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, cv); G.tw = cv.width; G.th = cv.height; }
+  else if (!G.noUpload) gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.uniform1i(u.uFrame, 0); gl.uniform1i(u.uPaper, 1);
+  gl.uniform2f(u.uSize, cv.width, cv.height);
+  gl.uniform2f(u.uOrigin, VIEW.offX, VIEW.offY);
+  const g = POST_OFF ? 0 : fx.gate * Math.max(1, Math.round(VIEW.S * 0.67));
+  gl.uniform2f(u.uGate, g, -g);
+  let red = [0, 0], blue = [0, 0];
+  if (state === 'title') red = [VIEW.offX + (brickX() + lampShift(COVER_DEPTH.figure)[0]) * VIEW.S, 0];
+  else if (L) { const [rx, ry] = offs(-1, k), [bx, by] = offs(1, k), [r0, r1] = settleOff(0), [b0, b1] = settleOff(2); red = [devX(rx + r0), devY(ry + r1)]; blue = [devX(bx + b0), devY(by + b1)]; }
+  gl.uniform2f(u.uRed, red[0], red[1]); gl.uniform2f(u.uBlue, blue[0], blue[1]);
+  gl.uniform1f(u.uS, VIEW.S);
+  gl.uniform1f(u.uSeed, state === 'title' ? 0 : state === 'brief' ? 11 : state === 'end' ? 12 : li + 1);
+  const tint = L && (state === 'play' || state === 'dead' || state === 'win') ? tintOf(sheetInk()) : sheetInk();
+  gl.uniform3fv(u.uPal, [sheetInk(), PAPER.cream, PAPER.green, PAPER.red, PAPER.blue, PAPER.white, PAPER.black, tint].map(h => hex3(h.startsWith('rgb') ? rgbHex(h) : h)).flat());
+  gl.uniform1i(u.uMode, POST_OFF ? 1 : 0);
+  const nl = Math.min(3, fx.lifts.length), lr = new Float32Array(12), la = new Float32Array(12);
+  for (let i = 0; i < nl; i++) { const q = fx.lifts[i]; lr.set(q.slice(0, 4), i * 4); la.set([q[4], q[5], q[6] || 0, 0], i * 4); }
+  gl.uniform1i(u.uNL, nl); gl.uniform4fv(u.uLR, lr); gl.uniform4fv(u.uLA, la);
+  const cr = fx.chipDev || [0, 0, -1, -1];
+  gl.uniform4f(u.uChip, cr[0], cr[1], cr[2], cr[3]);
+  gl.uniform3fv(u.uUnder, hex3(fx.under || '#000000')); gl.uniform1f(u.uHasUnder, fx.under ? 1 : 0);
+  // phantom inks for this sheet, solid and at the faint 80%, so the dash-dot outlines cast no paper shadow
+  const phi = state === 'title' ? PH_LIGHT : (L && (state === 'play' || state === 'dead' || state === 'win')) ? phInkFor(li) : null;
+  // typed Courier is ink, never paper: its colour and its anti-aliased blends with the field, so no edge casts a shadow
+  const fi = hex3(sheetInk()), ti = hex3(lightInk(sheetInk()) ? TEXT_DARK : TEXT_LIGHT), phl = [ti];
+  for (const t of [0.2, 0.4, 0.6, 0.8]) phl.push(ti.map((v, i) => fi[i] + (v - fi[i]) * t));
+  if (phi) for (const h of [phi.red, phi.blue, phi.run, PH_KEY]) { const c = hex3(h); phl.push(c, c.map((v, i) => fi[i] + (v - fi[i]) * PH_FAINT_A)); }
+  const pa = new Float32Array(48); phl.forEach((c, i) => pa.set(c, i * 3));
+  gl.uniform3fv(u.uPh, pa); gl.uniform1i(u.uNPh, phl.length);
+  gl.uniform2f(u.uLamp, (lamp.x * 0.5 + 0.5) * cv.width, (lamp.y * 0.5 + 0.5) * cv.height); gl.uniform1f(u.uLampW, RM ? 0 : lamp.w);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  fx.gate = 0;
+  if (G.measure) { gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, G.px || (G.px = new Uint8Array(4))); G.ms.push(performance.now() - t0); }
+}
+// Post-pass cost: upload + draw, synced with a 1-pixel readPixels so the GPU work is counted.
+window.__post = {
+  measure(n = 60, { upload = true } = {}) {
+    if (!G) return null;
+    G.ms = []; G.measure = true; G.noUpload = !upload;
+    for (let i = 0; i < n; i++) renderGL();
+    G.measure = false; G.noUpload = false;
+    const a = G.ms.slice().sort((x, y) => x - y);
+    return { n, median: a[a.length >> 1], p90: a[Math.floor(a.length * 0.9)], mean: a.reduce((s, v) => s + v, 0) / a.length, size: [cv.width, cv.height] };
+  },
+  get on() { return !!G; },
+};
+
+// Sound: office foley, WebAudio synthesis only, no music bed. Each cue fires on the frame of its visual.
+let ac = null, master = null, muted = false, noiseBuf = null;
+function initAudio(e) {
+  if (e && !e.isTrusted) return;                      // synthetic input (playtest, demo) never starts audio
+  if (navigator.userActivation && !navigator.userActivation.isActive) return;   // e.g. Esc: not a gesture, wait for one
   if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
   try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
-  master = ac.createGain(); master.gain.value = muted ? 0 : 0.6; master.connect(ac.destination);
-  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1400; lp.connect(master);
-  const pad = ac.createGain(); pad.gain.value = 0; pad.connect(lp);
-  pad.gain.setTargetAtTime(1, ac.currentTime, 0.8);
-  [220, 277.18, 329.63].forEach((f, i) => {
-    const o = ac.createOscillator(); o.type = i === 1 ? 'sine' : 'triangle'; o.frequency.value = f;
-    const g = ac.createGain(); g.gain.value = 0.05; o.connect(g); g.connect(pad); o.start(); voices.push(o);
-  });
-  noiseBuf = ac.createBuffer(1, ac.sampleRate * 0.5, ac.sampleRate);
+  master = ac.createGain(); master.gain.value = muted ? 0 : 0.7; master.connect(ac.destination);
+  noiseBuf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
   const nd = noiseBuf.getChannelData(0);
   for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+  // room tone: a soft fan
+  const fan = ac.createBufferSource(); fan.buffer = noiseBuf; fan.loop = true;
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420;
+  const bp = ac.createBiquadFilter(); bp.type = 'peaking'; bp.frequency.value = 130; bp.gain.value = 6;
+  const g = ac.createGain(); g.gain.value = 0; g.gain.setTargetAtTime(0.03, ac.currentTime, 1.5);
+  fan.connect(lp); lp.connect(bp); bp.connect(g); g.connect(master); fan.start();
 }
-function updateAudio() {
-  if (!ac || !L || voices.length < 3) return;
-  const d = k - L.kd, t = ac.currentTime;
-  voices[0].detune.setTargetAtTime(-d * 45, t, 0.04);
-  voices[2].detune.setTargetAtTime(d * 45, t, 0.04);
+function updateAudio() {}
+function nz(dur, type, freq, q, vol, delay = 0, decay = dur) {
+  const t = ac.currentTime + delay, s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+  s.buffer = noiseBuf; s.playbackRate.value = 0.9 + Math.random() * 0.2;
+  f.type = type; f.frequency.value = freq; f.Q.value = q;
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + decay);
+  s.connect(f); f.connect(g); g.connect(master); s.start(t, Math.random()); s.stop(t + dur + 0.05);
 }
 function tone(f0, f1, dur, wave, vol, delay = 0) {
   const t = ac.currentTime + delay, o = ac.createOscillator(), g = ac.createGain();
   o.type = wave; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
-  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.004);
   g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
   o.connect(g); g.connect(master); o.start(t); o.stop(t + dur + 0.02);
 }
-function noise(dur, freq, vol) {
-  const t = ac.currentTime, s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
-  s.buffer = noiseBuf; f.type = 'bandpass'; f.frequency.value = freq; f.Q.value = 0.8;
-  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-  s.connect(f); f.connect(g); g.connect(master); s.start(t); s.stop(t + dur + 0.02);
-}
 function sfx(type, v = 0) {
   if (!ac || muted || ac.state !== 'running') return;
-  if (type === 'jump') tone(420, 700, 0.12, 'square', 0.035);
-  else if (type === 'land') { tone(160, 60, 0.09, 'sine', clamp(v / 900, 0.02, 0.09)); noise(0.06, 500, 0.03); }
-  else if (type === 'splash') { noise(0.3, 900, 0.08); tone(520, 220, 0.15, 'sine', 0.02); }
-  else if (type === 'tick') tone(900 + v * 60, 900 + v * 60, 0.035, 'sine', 0.025);
-  else if (type === 'align') [1318.5, 1661.2, 1975.5].forEach((f, i) => tone(f, f, 0.5, 'sine', 0.03, i * 0.05));
-  else if (type === 'die') { tone(300, 50, 0.4, 'sawtooth', 0.07); noise(0.35, 300, 0.08); }
-  else if (type === 'resist') tone(110, 90, 0.05, 'square', 0.05);
-  else if (type === 'win') [440, 554.37, 659.25, 880].forEach((f, i) => tone(f, f, 0.25, 'triangle', 0.08, i * 0.08));
+  switch (type) {
+    case 'click':      // detent: noise burst + short resonant body, always the same pitch
+      nz(0.012, 'highpass', 2600, 0.7, 0.22); nz(0.06, 'bandpass', 1650, 22, 0.9, 0, 0.05); break;
+    case 'pin':        // the pin seats: lower and longer
+      nz(0.02, 'highpass', 1400, 0.7, 0.25); nz(0.18, 'bandpass', 560, 16, 1.4, 0, 0.16); nz(0.1, 'bandpass', 820, 14, 0.5, 0.028, 0.08); break;
+    case 'nib':        // nib scratch along the 0.4 s leader
+      for (let i = 0; i < 9; i++) nz(0.05, 'bandpass', 3600 + (i % 3) * 500, 3, 0.07 + 0.03 * (i % 2), i * 0.042, 0.04);
+      break;
+    case 'type':       // a typewriter strike
+      nz(0.006, 'highpass', 4200, 0.7, 0.35); nz(0.04, 'bandpass', 2300, 9, 0.7, 0, 0.03); tone(150, 85, 0.05, 'sine', 0.22); break;
+    case 'thump':      // felt stamp
+      nz(0.2, 'lowpass', 240, 0.8, 0.9, 0, 0.16); tone(82, 40, 0.2, 'sine', 0.5); break;
+    case 'thumpSoft':
+      nz(0.14, 'lowpass', 260, 0.8, 0.5, 0, 0.1); tone(90, 50, 0.12, 'sine', 0.28); break;
+    case 'jump': nz(0.03, 'bandpass', 1900, 1.5, 0.12); break;          // a paper flick
+    case 'land': nz(0.05, 'lowpass', 700, 0.7, clamp(v / 900, 0.08, 0.3)); break;
+    case 'splash': nz(0.3, 'bandpass', 900, 0.9, 0.25, 0, 0.28); break;
+    case 'resist': tone(120, 95, 0.05, 'sine', 0.2); nz(0.03, 'lowpass', 400, 0.7, 0.2); break;
+    case 'rip': nz(0.12, 'bandpass', 1100, 0.8, 0.35, 0, 0.1); break;
+    case 'pull':       // the sheet pulled off the light box: a dry paper swish rising
+      for (let i = 0; i < 6; i++) nz(0.07, 'bandpass', 700 + i * 380, 1.4, 0.10 + 0.02 * i, i * 0.035, 0.06); break;
+    case 'slide': nz(0.16, 'bandpass', 1500, 1.1, 0.08, 0, 0.14); break;   // the numeral slides into the title block
+  }
 }
 
-const IGNORED_ON_TITLE = ['ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight', 'Tab', 'Escape'];
+const IGNORED_ON_TITLE = ['ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight', 'Tab', 'Escape',
+  'KeyQ', 'KeyE', 'KeyM', 'KeyA', 'KeyD', 'ArrowLeft', 'ArrowRight', 'ArrowDown', 'KeyS', 'KeyC', 'CapsLock', 'ContextMenu'];
+function toTitle() { state = 'title'; keys.clear(); coverReset(); cut('title'); updateText(); }
+function setMuted(v) {
+  muted = v; if (master) master.gain.value = muted ? 0 : 0.7;
+  if (!TEST_MODE && !DEMO) try { localStorage.setItem(MUTE_KEY, muted ? '1' : '0'); } catch (e) { /* private mode */ }
+}
+try { muted = !TEST_MODE && !DEMO && localStorage.getItem(MUTE_KEY) === '1'; } catch (e) { muted = false; }
+// Space, arrows and paging keys must never scroll the page that hosts the game (itch.io's iframe).
+const NO_SCROLL = ['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown', 'Home', 'End'];
 addEventListener('keydown', e => {
-  initAudio();
-  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+  initAudio(e);
+  if (NO_SCROLL.includes(e.code)) e.preventDefault();
   if (e.repeat) return;
-  const m = /^Digit([0-9])$/.exec(e.code), n = m ? (m[1] === '0' ? 10 : +m[1]) : 0;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;           // leave browser shortcuts alone
+  const m = /^(?:Digit|Numpad)([0-9])$/.exec(e.code), n = m ? (m[1] === '0' ? 10 : +m[1]) : 0;
   const pick = n && n <= LEVELS.length ? n - 1 : null;
-  if (state === 'title') {
-    if (!IGNORED_ON_TITLE.includes(e.code)) startGame(pick !== null ? pick : best);
+  if (e.code === 'KeyM') { setMuted(!muted); return; }
+  if (state === 'brief') {
+    if (e.code === 'Escape') closeBrief();
+    else if (pick !== null) openSheet(pick);
+    else if (e.code === 'ArrowDown' || e.code === 'ArrowUp') { brief.sel = (brief.sel + (e.code === 'ArrowDown' ? 1 : LEVELS.length - 1)) % LEVELS.length; brief.hover = -1; sfx('click'); }
+    else if (e.code === 'Enter' || e.code === 'Space' || e.code === 'NumpadEnter') openSheet(brief.sel);
+    else if (e.code === 'KeyC') { snapCard('out'); toTitle(); }
     return;
   }
+  if (e.code === 'Escape') { openBrief(); return; }
+  if (state === 'title') {
+    if (e.code === 'KeyQ' || e.code === 'KeyE') coverLens(e.code === 'KeyQ' ? 1 : -1, true);
+    else if (pick !== null) jumpTo(pick, startGame);
+    else if (!IGNORED_ON_TITLE.includes(e.code)) startGame(best);
+    return;
+  }
+  if (state === 'end') {
+    if (e.code === 'KeyR') newFiling();
+    else if (e.code === 'KeyS') savePatent();
+    else if (pick !== null) jumpTo(pick, startGame);
+    return;
+  }
+  // Any key skips the death hold (real keys only, so the synthetic playtest is unaffected).
+  if (state === 'dead' && e.isTrusted && fx.dead && fx.dead.age >= FREEZE + CIRCLE_T) stT = 0;
+  if (fx.cut && fx.cut.kind === 'sheet' && fx.cut.go < 0) fx.cut.go = fx.cut.age;   // play begins: the numeral retracts
   keys.add(e.code);
   if (JUMP_KEYS.includes(e.code)) jumpBuf = 0.12;
-  if (e.code === 'Escape') { state = 'title'; keys.clear(); updateText(); return; }
-  if (e.code === 'KeyR') { if (state === 'end') startGame(0); else if (state === 'play') resetLevel(); }
-  if (e.code === 'KeyM') { muted = !muted; if (master) master.gain.value = muted ? 0 : 0.6; }
-  if (pick !== null) loadLevel(pick);
+  if (e.code === 'KeyR' && state === 'play') resetLevel();
+  if (pick !== null) jumpTo(pick, loadLevel);
 });
 addEventListener('keyup', e => keys.delete(e.code));
 addEventListener('blur', () => keys.clear());
-cv.addEventListener('wheel', e => {
-  e.preventDefault(); initAudio();
+function onWheel(e) {
+  e.preventDefault(); initAudio(e);
+  if (state === 'brief' || state === 'end') return;
   // One lens step per wheel notch (deltaY ~100), trackpads accumulate; short cooldown
   // so a single notch never counts twice.
   wheelAcc += e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
   if (Math.abs(wheelAcc) >= 40 && time - wheelT > 0.07) {
     const s = Math.sign(wheelAcc); wheelAcc = 0; wheelT = time;
+    if (state === 'title') { coverLens(s, true); return; }
+    if (fx.cut && fx.cut.kind === 'sheet' && fx.cut.go < 0) fx.cut.go = fx.cut.age;
     // horizontal: scroll down pushes red left; vertical: scroll down sinks red
     kT = clamp(Math.round(kT) + (L && L.ay ? -s : s), -KMAX, KMAX);
+    lensUI.lastTouch = time; lensUI.dir = L && L.ay ? -s : s;
   }
-}, { passive: false });
-cv.addEventListener('pointerdown', () => { initAudio(); cv.focus(); if (state === 'title') startGame(best); });
-
-let last = performance.now(), acc = 0;
-function frame(now) {
-  const rdt = Math.min(0.1, (now - last) / 1000);
-  acc += rdt; last = now;
-  if (!paused) while (acc >= DT) { update(DT); acc -= DT; } else acc = 0;
-  updateFx(rdt); render(); updateAudio();
-  requestAnimationFrame(frame);
 }
-updateText();
-requestAnimationFrame(frame);
+cv.addEventListener('wheel', onWheel, { passive: false });
+// Real wheels anywhere on the page (the WebGL canvas sits on top and ignores the pointer).
+addEventListener('wheel', e => { if (e.target !== cv) onWheel(e); }, { passive: false });
+const toBase = e => [(e.clientX - VIEW.cssX) / VIEW.cssS, (e.clientY - VIEW.cssY) / VIEW.cssS];
+const inBtn = (x, y) => x >= SAVE_BTN[0] && x <= SAVE_BTN[0] + SAVE_BTN[2] && y >= SAVE_BTN[1] && y <= SAVE_BTN[1] + SAVE_BTN[3];
+addEventListener('pointerdown', e => {
+  initAudio(e); cv.focus({ preventScroll: true });
+  const [x, y] = toBase(e);
+  if (state === 'title') { if (!tooSmall() && e.button === 0) startGame(best); return; }
+  if (state === 'brief') { const i = briefRowAt(x, y); if (i >= 0) openSheet(i); return; }
+  if (state === 'end' && inBtn(x, y)) savePatent();
+});
+addEventListener('pointermove', e => {
+  const [x, y] = toBase(e);
+  // the lamp: where the pointer is, normalised to the viewport and clamped
+  lamp.tx = clamp((e.clientX - innerWidth / 2) / (innerWidth / 2), -1, 1); lamp.ty = clamp((e.clientY - innerHeight / 2) / (innerHeight / 2), -1, 1); lamp.tw = 1;
+  hoverDial = (state === 'play' || state === 'dead' || state === 'win') && Math.hypot(x - TB.dialX, y - TB.dialY) < TB.r + 8;
+  const was = brief.hover;
+  brief.hover = state === 'brief' ? briefRowAt(x, y) : state === 'end' && inBtn(x, y) ? 99 : -1;
+  if (state === 'brief' && brief.hover >= 0 && brief.hover !== was) brief.sel = brief.hover;
+  document.documentElement.dataset.hot = brief.hover >= 0 || (state === 'title' && !tooSmall()) ? '1' : '0';
+});
+addEventListener('resize', () => { if (!FRAMES) layout(); });
 
-// Debug/test hook: drive the sim deterministically from the console.
+// ?demo: a scripted ~22 s tour keyed to sim steps, so it plays identically in real time and under ?__state=frames:
+// cover staged pair -> FIG. 1 alignment and 18 -> cut -> FIG. 2 death -> Esc to the Brief Description ->
+// digit 6 to FIG. 6 LIFT (vertical phantoms, the climb) -> completion pull-off -> cut to FIG. 7.
+const DEMO_T = s => Math.round(s * 120);
+const demo = { on: DEMO, prog: [], i: 0, step: 0, log: [] };
+function dLog(msg) { const e = [+(demo.step * DT).toFixed(3), msg]; demo.log.push(e); console.log(`[demo ${e[0].toFixed(2)}s] ${msg}`); }
+const Do = (msg, fn = () => {}) => () => { fn(); dLog(msg); return true; };
+const Wait = s => { let n = null; return () => { if (n === null) n = DEMO_T(s); return n-- <= 0; }; };
+const Until = (cond, msg) => () => { if (!cond()) return false; if (msg) dLog(msg); return true; };
+const press = c => CD.press(c), release = c => CD.release(c);
+const tap = c => { dispatchEvent(new KeyboardEvent('keydown', { code: c, bubbles: true })); dispatchEvent(new KeyboardEvent('keyup', { code: c, bubbles: true })); };
+demo.prog = [
+  Wait(0.45),
+  Do('cover: lens one stop while 10 stands on 12: 10 rides with 12 (10′ shown, "ON RED: CARRIED")', () => coverLens(-1)),
+  Wait(CAPTION_T),
+  Do('cover: 10 hops', () => coverHop()),
+  Wait(0.05),
+  Do('cover: lens back mid-air: 12 slides under, 10 stays put (no 10′, dimension line, "IN THE AIR: NOT CARRIED")', () => coverLens(1)),
+  Until(() => !cover.air, 'cover: 10 lands on 12'),
+  Wait(0.3),
+  Do('Enter: stamp thump cuts to FIG. 1, numeral full scale', () => startGame(0)),
+  Wait(0.6),
+  Do('hold Q (lens +1): strong phantoms 12′/10′ were already showing; the numeral retracts', () => press('KeyQ')),
+  Wait(0.12),
+  Do('release Q: lens snaps to k=1, runner carried left', () => release('KeyQ')),
+  Wait(0.55),
+  Do('hold Q again (lens +2)', () => press('KeyQ')),
+  Wait(0.12),
+  Do('release Q: lens snaps to k=2', () => release('KeyQ')),
+  Until(() => Math.abs(k - L.kd) < ALIGN_TOL),
+  Wait(0.5),
+  Do('walk right to the door', () => press('KeyD')),
+  Until(() => state === 'win', 'ALLOWED; the sheet lifts and is pulled off'),
+  Do('release D', () => release('KeyD')),
+  Until(() => li === 1 && state === 'play'),
+  Wait(0.3),
+  Do('walk right to the edge', () => press('KeyD')),
+  Until(() => p.x + p.w / 2 >= (7 - k) * T - 2, 'at the edge: jump'),
+  Do('jump', () => press('Space')),
+  Wait(0.08),
+  Do('mid-air: hold Q (lens toward +4): no 10′, dimension line to red', () => press('KeyQ')),
+  Wait(4 / 6),
+  Do('release Q', () => release('KeyQ')),
+  Until(() => p.grounded),
+  Do('release jump, keep walking right', () => release('Space')),
+  Wait(0.3),
+  Do('stop', () => release('KeyD')),
+  Wait(0.6),
+  Do('standing: hold E (lens back toward +1): 10′ already showed the carry into the spikes', () => press('KeyE')),
+  Until(() => state === 'dead'),
+  Do('release E', () => release('KeyE')),
+  Until(() => state === 'play'),
+  Wait(0.7),
+  Do('Esc: the Brief Description of the Drawings', () => tap('Escape')),
+  Wait(0.9),
+  Do('ArrowDown x2: select through the sheets', () => tap('ArrowDown')),
+  Wait(0.35),
+  Do('ArrowDown', () => tap('ArrowDown')),
+  Wait(0.8),
+  Do('digit 6: cut to FIG. 6 LIFT', () => tap('Digit6')),
+  Wait(0.75),
+  Do('walk to the tower', () => press('KeyD')),
+  Until(() => p.x >= 12 * T - 22, 'at the wall: jump'),
+  Do('jump', () => press('Space')),
+  Do('mid-air: hold E, the tower sinks two stops under 10 (vertical phantoms and dimension)', () => press('KeyE')),
+  Wait(2 / 6),
+  Do('release E', () => release('KeyE')),
+  Until(() => p.grounded && p.x > 12 * T, 'on the tower'),
+  Do('release jump', () => release('Space')),
+  Until(() => p.x >= 20 * T + 6),
+  Do('stop under the door', () => release('KeyD')),
+  Wait(0.35),
+  Do('hold Q: 10 rides the tower up five stops; door 18 aligns', () => press('KeyQ')),
+  Wait(5 / 6),
+  Do('release Q', () => release('KeyQ')),
+  Until(() => state !== 'play'),
+  Until(() => li === 6 && state === 'play', 'cut to FIG. 7'),
+  Wait(1.2),
+  Do('script ends'),
+];
+// Sim events are logged as they happen, independent of where the script is waiting.
+const seen = { state: null, li: -1, grounded: true, aligned: false };
+function demoWatch() {
+  const al = !!L && Math.abs(k - L.kd) < ALIGN_TOL;
+  if (L && li !== seen.li) dLog(`level ${li + 1} ${L.name} loaded`);
+  if (state !== seen.state) dLog(`state -> ${state}${state === 'dead' ? ' (hold 6 frames, circle, ANTICIPATED)' : ''}`);
+  if (al && !seen.aligned) dLog(`aligned at k=${L.kd}: door turns white, lifts, leader + "18"`);
+  if (p && state === 'play' && p.grounded !== seen.grounded && seen.li === li) dLog(p.grounded ? `landed (k=${k.toFixed(2)})` : 'airborne');
+  Object.assign(seen, { state, li: L ? li : -1, grounded: p ? p.grounded : true, aligned: al });
+}
+function demoTick() {
+  if (!demo.on) return;
+  demoWatch();
+  while (demo.i < demo.prog.length && demo.prog[demo.i]()) demo.i++;
+  demo.step++;
+}
+function simStep() {
+  demoTick();
+  if (state === 'title') { time += DT; updateCover(DT); return; }
+  update(DT);
+  if (state === 'play' || state === 'dead') { track.t += DT; if (state === 'play' && p.wet) track.swim += DT; }
+  const q = keys.has('KeyQ'), e = keys.has('KeyE');
+  if (q !== e && state === 'play') { lensUI.lastTouch = time; lensUI.dir = q ? 1 : -1; }
+}
+
 window.CD = {
   get k() { return k; }, get kT() { return kT; }, get p() { return p; }, get state() { return state; },
   get li() { return li; }, get deaths() { return deaths; }, get axis() { return L.axis; },
@@ -738,8 +2957,114 @@ window.CD = {
   press(c) { keys.add(c); if (JUMP_KEYS.includes(c)) jumpBuf = 0.12; }, release(c) { keys.delete(c); },
   lens(v) { kT = v; }, step(n = 1) { for (let i = 0; i < n; i++) update(DT); }, load: loadLevel,
   pause(v = true) { paused = v; keys.clear(); },
+  get demoLog() { return demo.log; },
+  get cover() { return { k: cover.k, x: cover.x, y: cover.y, air: cover.air }; },
+  // QA hooks (presentation only): open the pages, fill or read the filing.
+  brief: () => openBrief(), toTitle: () => toTitle(),
+  get filing() { return filing; }, setFiling(f) { filing = f; },
+  claim: i => claimBody(i), end() { state = 'end'; updateText(); },
 };
-// index.html?test runs the automated playtest (playtest.js) against every level.
+// QA (presentation only): every label's clearances in the last frame, in the jurors' 1440-frame px.
+window.__labelAudit = () => {
+  if (!L || !fx.placed) return null;
+  const e = 0.01, out = [], rb = [p.x - 1, p.y + 4, 22, 22], vb = visWorld();
+  const st = fx.stamp || (state === 'win' && fx.lastAllowed), sb = st ? stampAABB(st.word, st.x, st.y, st.rot) : null, arc = fx.stamp && fx.stamp.arc && fx.stamp.arc.length > 1 ? fx.stamp.arc : null;
+  fx.placed.forEach((q, i) => {
+    if (q.yielded) { out.push({ txt: q.txt, v: [], yielded: true }); return; }
+    if (q.al !== undefined && q.al <= 0.004) return;
+    const v = [];
+    if (tilesIn(q.box, JW(12) - e, k)) v.push('terrain<12');
+    if (ovl(q.box, rb, JW(12) - e)) v.push('runner<12');
+    fx.placed.forEach((r, j) => { if (j > i && (r.al === undefined || r.al > 0.004) && ovl(q.box, r.box, JW(12) - e)) v.push('label<12 ' + r.txt); });
+    q.anchors.forEach(a => { const [ex, ey] = nearOn(q.box, a[0], a[1]); if (Math.hypot(ex - a[0], ey - a[1]) < JW(24) - 0.05) v.push('leader<24'); });
+    if (q.box[0] < vb[0] || q.box[1] < vb[1] || q.box[0] + q.box[2] > vb[2] || q.box[1] + q.box[3] > vb[3]) v.push('off-frame');
+    for (const t of titleObstacles()) if (ovl(q.box, t, 0)) v.push('title');
+    for (const b of railLayout().boxes) { const [x, y] = b2w(b[0], b[1]); if (ovl(q.box, [x, y, b[2] / WP.Z, b[3] / WP.Z], JW(12) - e)) v.push('rail<12'); }
+    if (sb) {
+      if (ovl(q.box, sb, JW(24) - e)) v.push('stamp<24');
+      q.legs.forEach(([ex, ey, x, y]) => { if (segRect(ex, ey, x, y, sb, JW(24) - e, 0)) v.push('leader-stamp<24'); });
+    }
+    if (arc) q.legs.forEach(([ex, ey, x, y]) => { if (arcCross(ex, ey, x, y, arc)) v.push('leader×arc'); });
+    if (arc && arcNear(q.box, arc, JW(12) - e)) v.push('arc<12');
+    out.push({ txt: q.txt, v });
+  });
+  // the death stamp: 40 px clear above the dotted arc under it
+  if (fx.stamp && fx.stamp.arc && sb) {
+    const v = [];
+    for (const [x, y] of fx.stamp.arc) if (x >= sb[0] - JW(24) && x <= sb[0] + sb[2] + JW(24) && y < sb[1] + sb[3] + JW(40) - 0.05) { v.push('stamp-apex<40'); break; }
+    if (sb[1] < vb[1]) v.push('stamp off-frame');
+    out.push({ txt: 'STAMP', v });
+  }
+  if (fx.door) {
+    const { s, e: d, box } = fx.door, v = [], l = Math.hypot(d[0] - s[0], d[1] - s[1]);
+    for (let i = 1; i < 40; i++) { const u = i / 40; if ((1 - u) * l < 3) continue; if (tilesIn([s[0] + (d[0] - s[0]) * u, s[1] + (d[1] - s[1]) * u, 0, 0], 0.5, k, [0])) { v.push('leader on red'); break; } }
+    if (tilesIn(box, JW(12) - e, k)) v.push('terrain<12');
+    if (l < JW(24) - 0.05) v.push('leader<24');
+    for (const q of fx.placed) if ((q.al === undefined || q.al > 0.004) && ovl(q.box, box, JW(12) - e)) v.push('label<12 ' + q.txt);
+    out.push({ txt: '18', v });
+  }
+  return out;
+};
+// QA (presentation only): the world's placement and the labels last placed, in device px.
+window.__wp = () => {
+  const css = VIEW.S / VIEW.cssS, tob = titleObstacles();
+  return { Z: WP.Z, scale: WS() / css, free: WP.f, world: [devX(0), devY(0), devX(W), devY(H)].map(v => v / css),
+    band: WP.band && [WP.band.top, WP.band.bot].map(v => (VIEW.offY + v * VIEW.S) / css),
+    // the title card lies wholly in the rows proven free (world y <= f rows), or above the world
+    titleClear: tob.every(b => b[1] + b[3] <= WP.f * T + 1e-6) };
+};
+
+layout();
+updateText();
+G = initGL();
+// Big Shoulders Display measures differently from the Impact fallback: size the huge numerals from the real glyph.
+const fontReady = (document.fonts && document.fonts.load ? Promise.all([document.fonts.load(bs(100, 900), '0123456789'), document.fonts.load(bs(100, 800), 'FIG.'), document.fonts.load(bs(20, 600), 'a'), document.fonts.load(cp(16, 400), 'a'), document.fonts.load(cp(16, 700), 'a')]) : Promise.resolve())
+  .catch(() => {}).then(() => {
+    ctx.font = bs(100, 900); ctx.textBaseline = 'alphabetic'; const m = ctx.measureText('1');
+    if (m.actualBoundingBoxAscent > 10) numRatio = m.actualBoundingBoxAscent / 100;
+  });
+
+// Adaptive tier: if WebGL2 is lost, or frames run slow for a sustained stretch with the post pass on,
+// drop to the Canvas2D drawing (the same sheet, without the paper pass).
+function dropGL(why) {
+  if (!G) return;
+  try { const ext = G.gl.getExtension('WEBGL_lose_context'); if (ext && why !== 'lost') ext.loseContext(); } catch (e) { /* already gone */ }
+  G = null; document.documentElement.dataset.gl = 'off'; window.__tier = `2d (${why})`;
+  console.info(`[chromatic-drift] paper pass off: ${why}`);
+}
+glc.addEventListener('webglcontextlost', e => { e.preventDefault(); dropGL('lost'); });
+window.__tier = G ? 'gl' : (GL_OFF ? '2d (gl-off)' : '2d (no webgl2)');
+
+if (FRAMES) {
+  // Nothing advances on its own: no rAF loop. The sim only moves inside step(), and the
+  // post pass renders exactly once per step, on virtual time.
+  paused = true;
+  let vt = 0, steps = 0;
+  window.__frames = {
+    ready: fontReady.then(() => { render(); renderGL(); }),
+    step(ms) {
+      vt += ms;
+      const target = Math.floor(vt * 120 / 1000 + 1e-6);
+      while (steps < target) { simStep(); steps++; }
+      updateFx(ms / 1000); render(); renderGL();
+    },
+    time() { return vt; },
+  };
+} else {
+  let last = performance.now(), acc = 0, slow = 0, nFrames = 0;
+  const frame = now => {
+    const raw = (now - last) / 1000, rdt = Math.min(0.1, raw);
+    acc += rdt; last = now;
+    if (!paused) while (acc >= DT) { simStep(); acc -= DT; } else acc = 0;
+    updateFx(rdt); render(); renderGL(); updateAudio();
+    // ~1.5 s of frames slower than 40 fps while visible: the post pass goes.
+    if (G && !document.hidden && raw < 0.25) { nFrames++; if (nFrames > 90) slow = raw > 1 / 40 ? slow + 1 : Math.max(0, slow - 2); if (slow > 60) dropGL('slow frames'); }
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+  fontReady.then(() => { if (!document.hasFocus || document.hasFocus()) cv.focus({ preventScroll: true }); });
+}
+// ?test runs the automated playtest (playtest.js) against every level.
 if (TEST_MODE) {
   const s = document.createElement('script'); s.src = 'playtest.js'; document.body.appendChild(s);
 }

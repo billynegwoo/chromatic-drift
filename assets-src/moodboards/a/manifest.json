@@ -1,0 +1,31 @@
+[
+  {
+    "id": "hero-a-codex",
+    "file": "hero-a-codex.png",
+    "width": 1440,
+    "height": 900,
+    "aspect": "landscape",
+    "kind": "comp",
+    "viewport": "1440x900",
+    "engineSize": {
+      "width": 1586,
+      "height": 992
+    },
+    "crop": {
+      "from": "centre",
+      "left": 0,
+      "top": 1,
+      "width": 1586,
+      "height": 991,
+      "scale": 0.9079
+    },
+    "engineFile": "hero-a-codex-engine.png",
+    "transparent": false,
+    "prompt": "Direction A, \"Photostat\": the title screen presented as an examiner's photostat negative of a 1950s US patent drawing. Deep blue-black ground with faint silver paper fibre; every line is cool white like light through a copy camera, with a slight halo bleed. A ruled sheet border; a narrow right margin holding a small circular dial with tick marks and two short arrows. In the lower half, the drawing: a tiny square runner standing on a long block filled with fine vertical hatching, a gap, then another block; a dash-dot phantom outline of the block shifted one step sideways; thin curved leader lines pointing at parts with blank tags at their ends. Toward the right, three tall door-shaped rectangles side by side, one hatched vertically, one diagonally, one horizontally. A single accent: one red pencil circle. Engraved, precise, quiet, generous dark negative space in the upper half. Only faint desaturated tints of red, green and blue inside the hatching.",
+    "preambleSha256": "4d03a9e82250e368",
+    "tool": "codex-cli built-in image_gen",
+    "engineVersion": "codex-cli 0.163.0",
+    "seconds": 62,
+    "createdAt": "2026-11-05T20:28:51.066Z"
+  }
+]

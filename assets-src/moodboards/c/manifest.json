@@ -1,0 +1,31 @@
+[
+  {
+    "id": "hero-c-codex",
+    "file": "hero-c-codex.png",
+    "width": 1440,
+    "height": 900,
+    "aspect": "landscape",
+    "kind": "comp",
+    "viewport": "1440x900",
+    "engineSize": {
+      "width": 1536,
+      "height": 1024
+    },
+    "crop": {
+      "from": "centre",
+      "left": 0,
+      "top": 32,
+      "width": 1536,
+      "height": 960,
+      "scale": 0.9375
+    },
+    "engineFile": "hero-c-codex-engine.png",
+    "transparent": false,
+    "prompt": "Direction C, \"Red only\": the title screen drawn in a single colour, an examiner's red pencil on near-black paper. Everything is the same red, graphite-like and slightly grainy: the ruled sheet border, a small circular dial in the right margin, thin curved leader lines, and three kinds of hatching that tell the layers apart (vertical lines, diagonal lines, horizontal lines). A tiny square runner stands on a long vertically hatched block; a gap; another block; a row of small diagonally hatched teeth. Exactly one small tall rectangle near the right is pure white, the only thing on screen that is not red, where three hatched door shapes overlap. Stark, tense, minimal, a lot of dark empty space.",
+    "preambleSha256": "4d03a9e82250e368",
+    "tool": "codex-cli built-in image_gen",
+    "engineVersion": "codex-cli 0.163.0",
+    "seconds": 49,
+    "createdAt": "2026-11-05T20:28:37.779Z"
+  }
+]
