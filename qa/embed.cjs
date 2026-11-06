@@ -54,8 +54,8 @@ const { chromium } = require('/Users/kevin/.claude/skills/award-site/scripts/nod
     await fr.evaluate(() => { CD.setFiling(Array.from({ length: 10 }, () => ({ t: 10, d: 0, steps: 2, air: 1, airUp: 1, carry: 1, carryUp: 1, swim: 0 }))); CD.end(); });
     await page.waitForTimeout(2600);
     const dl = page.waitForEvent('download', { timeout: 5000 });
-    // SAVE_BTN in drawing px -> iframe px (960x540 iframe: 1 drawing px = 1 css px)
-    await page.mouse.click(box.x + 520 + 118, box.y + 488 + 20);
+    // SAVE_BTN in drawing px -> iframe px (960x540 iframe: 1 drawing px = 1 css px); it sits left of FILE A CONTINUATION
+    await page.mouse.click(box.x + 316 + 106, box.y + 488 + 20);
     const d = await dl, f = path.join(hostDir, await d.suggestedFilename()); await d.saveAs(f);
     console.log('download:', path.basename(f), fs.statSync(f).size, 'bytes');
     fs.copyFileSync(f, path.join(__dirname, 'shots', 'saved-patent.png'));

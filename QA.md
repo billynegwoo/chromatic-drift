@@ -119,5 +119,6 @@ Jam stars: Graphics 4 / 5 / 5, Innovation 4 / 5 / 5, Theme 4 / 5 / 5, Overall 4 
 | 10 | file://, Pages, itch iframe | index.html, fonts/ | no external requests, focus on click, host never scrolls (embed checks) |
 | 11 | layout-aware labels, wheel | index.html | K() labels on cover, rail caption and phone card; wheel one step per notch |
 | 12 | itch.io submission before Dec 1 13:37 PST | dist/ | `dist/chromatic-drift-itch.zip` (index.html, playtest.js, fonts/, LICENSE, README.md; 260 KB) and `dist/itch-cover-630x500.png` prepared; **the upload is the user's step** |
+| 13 | continuation (endless mode) | endless.js, index.html, playtest.js | `?test`: FIG. 11–40 × 3 serials, 90/90 solvable (keys + wheel), validator and replay agree 90/90, reproducible 90/90, tolerance 0.90 → 0.48 (min 0.44); label audit 0 violations over FIG. 11–40 at every lens stop (380 frames); motionqa PASS; `qa/endless-shots.cjs`, `qa/endless-play.cjs` |
 
 **Handoffs (need a human)**: listen to the sound on real speakers and headphones; play all ten sheets by hand on a real keyboard (the feel, the lens step); submit on itch.io; decide whether the design documents and sketches go in the public repo (heavy captures are excluded, below).

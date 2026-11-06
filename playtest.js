@@ -155,4 +155,104 @@
   const allOk = rows.every(r => r.keys === 'pass' && r.wheel === 'pass');
   document.getElementById('hint').innerHTML = `<b>Playtest ${allOk ? 'passed' : 'FAILED'}</b><br>` +
     rows.map(r => `${r.level}: keys ${r.keys}, wheel ${r.wheel}${r.sloppy ? `, sloppy inputs ${r.sloppy}` : ''}`).join('<br>');
+
+  // ---- The continuation (endless.js): sheets FIG. 11-40 for three fixed serial numbers, generated through the
+  // game's own path (the hidden ?validate frame), then replayed here with this file's verbs, keys and wheel, and
+  // re-measured with the same sloppy sweep. Asserts: every sheet solvable; the measured tolerance never below the
+  // floor (0.35); its rolling mean (5 sheets) never rising by more than 0.1, and the last five below the first five.
+  // The rows above are unchanged; the result is window.ENDLESS_TEST and one line under them.
+  if (!window.CDX) return;
+  const hint = document.getElementById('hint'), head = hint.innerHTML;
+  const SEEDS = [8812, 1951, 4417], N0 = 11, N1 = 40, FLOOR = 0.35, TOL = 0.1, WIN = 5;
+  hint.innerHTML = head + '<br>Endless: generating FIG. 11–40 for three serial numbers…';
+  // the continuation's verbs, built from the ones above with the same timings as endless.js's generators
+  function hopLens(n, o) { down('Space'); wait(30 + o.delay); lens(n); until(() => P().grounded, 3000); up('Space'); wait(150); }
+  function walkToHopping(x, hopXs) {
+    down('KeyD'); const hops = [...hopXs];
+    for (let n = 0, max = 8000 * HZ / 1000; n < max && CD.state === 'play'; n++) {
+      if (hops.length && P().x + P().w >= hops[0]) { hops.shift(); down('Space'); wait(350); up('Space'); }
+      if (P().x >= x && P().grounded) break;
+      CD.step(1);
+    }
+    up('KeyD'); wait(120);
+  }
+  function catchFall(n, o) {
+    down('KeyD'); until(() => !P().grounded, 3000);
+    wait(o.delay);
+    lens(n, { each: () => { if (P().grounded) up('KeyD'); } });
+    up('KeyD'); wait(150);
+  }
+  const pos = a => typeof a === 'number' ? a : a.red !== undefined ? (a.red - CD.k) * T + (a.off || 0) : (a.blue + CD.k) * T + (a.off || 0);
+  function runScript(script, o) {
+    for (const [v, a, b] of script) {
+      if (CD.state !== 'play') break;
+      if (v === 'lens') lens(a);
+      else if (v === 'walkTo') walkTo(pos(a));
+      else if (v === 'leap') leap(pos(a), b, o);
+      else if (v === 'climb') climb(a, b, o);
+      else if (v === 'hopLens') hopLens(a, o);
+      else if (v === 'swimOnto') swimOnto(a);
+      else if (v === 'walkToHopping') walkToHopping(pos(a), b);
+      else if (v === 'catchFall') catchFall(a, o);
+    }
+  }
+  function attemptDef(i, def, o = { early: 0, delay: 0 }, wheel = false) {
+    CD.pause(); CD.loadDef(i, def); useWheel = wheel;
+    const d0 = CD.deaths;
+    try { runScript(def.cip.script, o); } catch (e) { console.error(e); }
+    until(() => CD.state !== 'play', 2000);
+    for (const c of ['KeyA', 'KeyD', 'KeyQ', 'KeyE', 'Space']) up(c);
+    return CD.state === 'win' && CD.deaths === d0;
+  }
+  function measure(i, def) {
+    const keysOk = attemptDef(i, def), wheelOk = attemptDef(i, def, undefined, true);
+    let pass = 0;
+    for (const early of CDX.EARLY) for (const delay of CDX.DELAY) if (early || delay ? attemptDef(i, def, { early, delay }) : keysOk) pass++;
+    return { keysOk, wheelOk, pass };
+  }
+  const host = CDX.host();
+  let pumping = true;
+  const pump = () => { host.tick(40); if (pumping) requestAnimationFrame(pump); };
+  requestAnimationFrame(pump);
+  (async () => {
+    const t0 = performance.now(), seeds = {};
+    let solvable = 0, total = 0, same = 0, det = 0, falls = 0, ok = true;
+    const why = [];
+    for (const seed of SEEDS) {
+      const list = seeds[seed] = [];
+      for (let n = N0; n <= N1; n++) {
+        const res = await host.request(seed, n), def = CDX.makeDef(res.data, rect), m = measure(n - 1, def);
+        total++;
+        if (m.keysOk && m.wheelOk) solvable++; else { ok = false; why.push(`${seed}/FIG. ${n} not solved`); }
+        if (m.pass === res.pass) same++;
+        if (res.fallback) falls++;
+        // sheet n of serial number S is a function of (S, n): composing the accepted try again gives the same sheet
+        if (!res.fallback && JSON.stringify(CDX.compose(seed, n, res.composed - 1)) === JSON.stringify(res.data)) det++;
+        list.push({ n, name: res.data.name, axis: res.data.axis, kmax: res.data.kmax, beats: res.data.beats.length, pass: m.pass, ratio: +(m.pass / CDX.RUNS).toFixed(3),
+          validatorPass: res.pass, band: res.band, attempts: res.attempts, ms: res.ms, fallback: res.fallback, keys: m.keysOk, wheel: m.wheelOk });
+      }
+      const r = list.map(x => x.ratio), roll = r.map((_, j) => j < WIN - 1 ? null : r.slice(j - WIN + 1, j + 1).reduce((a, b) => a + b, 0) / WIN).filter(v => v !== null);
+      if (Math.min(...r) < FLOOR) { ok = false; why.push(`${seed}: below the floor`); }
+      for (let j = 1; j < roll.length; j++) if (roll[j] > roll[j - 1] + TOL) { ok = false; why.push(`${seed}: rolling mean rises at FIG. ${N0 + j + WIN - 1}`); }
+      if (!(roll[roll.length - 1] < roll[0])) { ok = false; why.push(`${seed}: no downward trend`); }
+    }
+    // the known-good fallback at every lens travel
+    const fb = [N0, 20, N1].map(n => attemptDef(n - 1, CDX.makeDef(CDX.fallback(n), rect)));
+    if (!fb.every(Boolean)) { ok = false; why.push('fallback sheet fails'); }
+    if (same !== total) { ok = false; why.push(`validator and replay disagree on ${total - same}`); }
+    if (det !== total - falls) { ok = false; why.push('not deterministic'); }
+    pumping = false;
+    const all = Object.values(seeds).flat(), ms = all.map(x => x.ms).filter(Boolean).sort((a, b) => a - b), att = all.map(x => x.attempts);
+    const curve = Object.fromEntries(SEEDS.map(s => [s, seeds[s].map(x => x.pass).join('')]));
+    const summary = { solvable: `${solvable}/${total}`, sameAsValidator: `${same}/${total}`, deterministic: `${det}/${total - falls}`, fallbacks: falls, fallbackSheets: fb.every(Boolean),
+      firstFive: +(all.filter(x => x.n < N0 + 5).reduce((a, x) => a + x.ratio, 0) / (5 * SEEDS.length)).toFixed(3),
+      lastFive: +(all.filter(x => x.n > N1 - 5).reduce((a, x) => a + x.ratio, 0) / (5 * SEEDS.length)).toFixed(3),
+      minRatio: Math.min(...all.map(x => x.ratio)), msPerSheet: { median: ms[ms.length >> 1], max: ms[ms.length - 1] },
+      attempts: { mean: +(att.reduce((a, b) => a + b, 0) / att.length).toFixed(2), max: Math.max(...att) }, wallSeconds: +((performance.now() - t0) / 1000).toFixed(1), curve };
+    window.ENDLESS_TEST = { done: true, ok, why, summary, seeds };
+    console.log('ENDLESS_TEST', ok ? 'passed' : 'FAILED', summary, why);
+    CD.pause(false); CD.load(0);
+    hint.innerHTML = head + `<br><b>Endless ${ok ? 'passed' : 'FAILED'}</b>: FIG. 11–40 × 3 serials, ${solvable}/${total} solvable (keys + wheel), ` +
+      `tolerance ${summary.firstFive} → ${summary.lastFive} (floor ${FLOOR}, min ${summary.minRatio.toFixed(2)}), ${summary.attempts.mean} tries/sheet, ${summary.msPerSheet.median} ms/sheet${why.length ? ' · ' + why.join('; ') : ''}`;
+  })();
 })();
