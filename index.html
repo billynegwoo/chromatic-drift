@@ -195,6 +195,7 @@ float fbm(vec3 p, int octaves, float lacunarity, float persistence) {
     return sum / norm;
 }
 </script>
+<script src="endless.js"></script>
 <script>
 'use strict';
 // Chromatic Drift — prototype
@@ -219,6 +220,9 @@ const SAVE_KEY = 'chromatic-drift.best', FILING_KEY = 'chromatic-drift.filing', 
 const TEST_MODE = /[?&]test\b/.test(location.search);   // playtest visits every level; don't save that
 const ST = new Set(new URLSearchParams(location.search).getAll('__state').flatMap(v => v.split(',')));
 const FRAMES = ST.has('frames'), DEMO = /[?&]demo\b/.test(location.search), GL_OFF = ST.has('gl-off'), POST_OFF = ST.has('post-off');
+// ?validate: the continuation's validator (endless.js), run headless in a hidden iframe: the sim only, nothing drawn,
+// nothing stored, no frame loop. It steps generated sheets through their solutions and reports back by postMessage.
+const VALIDATE = /[?&]validate\b/.test(location.search);
 
 if (TEST_MODE) document.documentElement.classList.add('test');
 const cv = document.getElementById('c'), ctx0 = cv.getContext('2d', { alpha: false });
@@ -251,7 +255,8 @@ function hits(g, ox, oy, x, y, w, h) {
   return false;
 }
 
-// axis: which way the lens slides layers. kd: lens value that aligns the exit.
+// axis: which way the lens slides layers. kd: lens value that aligns the exit. kmax (optional): the lens's travel,
+// +-KMAX when absent (the ten sheets below); the continuation's sheets narrow it.
 const LEVELS = [
   {
     name: 'LENS', axis: 'x', k0: 0, kd: 2, door: { x: 18, y: 10 }, spawn: { x: 3, y: 11 },
@@ -362,6 +367,11 @@ const LEVELS = [
   },
 ];
 
+// The continuation-in-part (endless.js): sheets FIG. 11, 12, ... are generated in the LEVELS format and registered
+// here by index (li 10 = FIG. 11). The ten sheets above are never touched.
+const CONT = new Map();
+const defAt = i => i < LEVELS.length ? LEVELS[i] : CONT.get(i);
+const kmaxOf = (d = L) => (d && d.kmax) || KMAX;
 let li = 0, L = null, k = 0, kT = 0, p = null, state = 'title', stT = 0, deaths = 0, time = 0, runT = 0;
 let jumpBuf = 0, resistShake = 0, lastResist = -1, wheelAcc = 0, wheelT = -1, paused = false, deathAt = null;
 let wasAligned = false;
@@ -371,18 +381,19 @@ const offs = (s, kk) => [(-PAD + s * kk * L.ax) * T, (-PAD + s * kk * L.ay) * T]
 let best = 0;
 try { best = clamp(parseInt(localStorage.getItem(SAVE_KEY), 10) || 0, 0, LEVELS.length - 1); } catch (e) { best = 0; }
 function saveBest(i) {
+  if (i >= LEVELS.length) return;                     // the continuation keeps its own best depth, per serial number
   best = Math.max(best, i);
-  if (TEST_MODE || DEMO) return;
+  if (TEST_MODE || DEMO || VALIDATE) return;
   try { localStorage.setItem(SAVE_KEY, String(best)); } catch (e) { /* private mode: progress just isn't kept */ }
 }
 
 function loadLevel(i) {
   li = i;
-  const d = LEVELS[i], R = grid(), G = grid(), B = grid();
+  const d = defAt(i), R = grid(), G = grid(), B = grid();
   d.build(R, G, B);
   const ax = d.axis === 'y' ? 0 : 1, ay = 1 - ax;
-  // Door thirds sit wherever they need to be so they meet at d.door when k = kd.
-  const layers = [
+  // Door thirds sit wherever they need to be so they meet at d.door when k = kd. (The validator draws nothing.)
+  const layers = VALIDATE ? [] : [
     makeLayer(R, 0, { x: d.door.x + d.kd * ax, y: d.door.y + d.kd * ay }),
     makeLayer(G, 1, d.door),
     makeLayer(B, 2, { x: d.door.x - d.kd * ax, y: d.door.y - d.kd * ay }),
@@ -406,9 +417,9 @@ const levelKeys = () => LEVELS.length >= 10 ? '1–9, 0' : `1–${LEVELS.length}
 function updateText() {
   if (TEST_MODE && window.PLAYTEST) return;              // the playtest's table owns #hint
   hintEl.textContent = state === 'title' ? 'Chromatic Drift. A lens-shifting puzzle platformer · GitHub Game Off 2026 · theme: SHIFT. Press Space to begin.'
-    : state === 'end' ? `Letters Patent granted. ${K('KeyS')} saves the patent as an image, ${K('KeyR')} starts a new filing.`
+    : state === 'end' ? `Letters Patent granted. ${K('KeyC')} files a continuation (serial number ${cip.seed}), ${K('KeyS')} saves the patent as an image, ${K('KeyR')} starts a new filing.`
     : state === 'brief' ? `Brief Description of the Drawings. Press ${levelKeys()} or click a line to open a sheet, Esc to return.`
-    : (L ? `FIG. ${li + 1}, ${L.name}. ${L.hint()}` : '');
+    : (L ? `FIG. ${li + 1}, ${L.name}.${li >= LEVELS.length && cip.run ? ` Continuation-in-part, serial number ${cip.run.seed}, ${cip.run.cleared} claims allowed.` : ''} ${L.hint()}` : '');
   helpEl.textContent = `${K('KeyA')}/${K('KeyD')} or ←/→ move · ${K('KeyW')}/↑/Space jump · ${K('KeyQ')}/${K('KeyE')} or wheel: lens · ${K('KeyR')} restart · ${K('KeyM')} mute · ${levelKeys()} sheet select · Esc Brief Description of the Drawings`;
 }
 
@@ -449,6 +460,7 @@ function update(dt) {
     if (stT <= 0) {
       if (state === 'dead') resetLevel();
       else if (li + 1 < LEVELS.length) loadLevel(li + 1);
+      else if (li >= LEVELS.length) { if (!contAdvance(li + 1)) stT = 0; }   // the next continuation sheet, once filed
       else { state = 'end'; updateText(); }
     }
     return;
@@ -461,7 +473,7 @@ function update(dt) {
   if (q && !e) kT += LENS_KEY_RATE * dt;
   else if (e && !q) kT -= LENS_KEY_RATE * dt;
   else kT = Math.round(kT);                       // soft detents on whole tiles
-  kT = clamp(kT, -KMAX, KMAX);
+  kT = clamp(kT, -kmaxOf(), kmaxOf());
   const kBefore = k;
   const dk = clamp(kT - k, -LENS_MAX_RATE * dt, LENS_MAX_RATE * dt);
   if (Math.abs(dk) > 1e-6 && !applyK(k + dk)) {
@@ -853,7 +865,7 @@ const track = { t: 0, d: 0, steps: 0, air: 0, airUp: 0, carry: 0, carryUp: 0, sw
 let filing = new Array(LEVELS.length).fill(null);
 try { const f = JSON.parse(localStorage.getItem(FILING_KEY) || 'null'); if (Array.isArray(f) && !DEMO && !TEST_MODE) f.slice(0, LEVELS.length).forEach((c, i) => { if (c && typeof c.t === 'number') filing[i] = c; }); } catch (e) { /* no filing yet */ }
 function saveFiling() {
-  if (TEST_MODE || DEMO) return;
+  if (TEST_MODE || DEMO || VALIDATE) return;
   try { localStorage.setItem(FILING_KEY, JSON.stringify(filing)); } catch (e) { /* private mode */ }
 }
 // Free rows, from the level data alone (presentation only): the screen rows 0..f-1 that nothing can ever occupy.
@@ -866,7 +878,7 @@ function freeRows(d = L) {
   let first = ROWS, reach = Infinity;
   const on = (x, y) => x >= 0 && x < COLS && y >= 0 && y < ROWS;
   const frags = [[0, d.door.x + d.kd * d.ax, d.door.y + d.kd * d.ay], [1, d.door.x, d.door.y], [2, d.door.x - d.kd * d.ax, d.door.y - d.kd * d.ay]];
-  for (let kk = -KMAX; kk <= KMAX; kk++) {
+  for (let kk = -kmaxOf(d); kk <= kmaxOf(d); kk++) {
     [d.R, d.G, d.B].forEach((g, ch) => {
       const s = ch - 1, sx = s * kk * d.ax, sy = s * kk * d.ay;
       for (let gy = 0; gy < MH; gy++) for (let gx = 0; gx < MW; gx++) {
@@ -893,6 +905,7 @@ function onLoadLevel() {
   if (L.free === undefined) L.free = freeRows();
   placeSheet();
   cut('sheet');
+  cipOnLoad();
   // arrived from under a pulled-off sheet: its numeral is already cut in, so it doesn't slam in again; after the
   // first handoff of a session the next sheet settles fast (the whole handoff in 650 ms)
   if (fx.pulled === li) { fx.cut.pre = true; if (fx.pulls++ > 0) fx.cut.quick = true; }
@@ -929,7 +942,9 @@ const juice = {
   die() { fx.prior.push(fx.path.concat([[p.x + p.w / 2, p.y + p.h / 2 + 2]])); track.d++; sfx('rip'); },
   win() {
     fx.winAge = 0;
-    filing[li] = { t: +track.t.toFixed(2), d: track.d, steps: track.steps, air: track.air, airUp: track.airUp, carry: track.carry, carryUp: track.carryUp, swim: +track.swim.toFixed(2) };
+    const rec = { t: +track.t.toFixed(2), d: track.d, steps: track.steps, air: track.air, airUp: track.airUp, carry: track.carry, carryUp: track.carryUp, swim: +track.swim.toFixed(2) };
+    if (li >= LEVELS.length) { cipOnWin(rec); return; }       // a continuation sheet: its claim goes to the run
+    filing[li] = rec;
     saveFiling();
   },
 };
@@ -1006,7 +1021,7 @@ function updateFx(dt) {
     const pt = PULL0 + pullTimes().lift;
     if (!RM && w0 < pt && fx.winAge >= pt) sfx('pull');
   }
-  if (state === 'end' && fx.endAge < 0) { fx.endAge = 0; cut('grant'); }
+  if (state === 'end' && fx.endAge < 0) { fx.endAge = 0; cut('grant'); cipPrefetch(cip.seed, CIP_N0); }
   else if (state === 'end') {
     const e0 = fx.endAge; fx.endAge += dt;
     for (let i = 0; i < LEVELS.length; i++) { const t = GRANT_T0 + i * GRANT_DT; if (!RM && e0 < t && fx.endAge >= t) sfx('type'); }
@@ -1048,8 +1063,9 @@ function stopToward(dir, kk = k, lo = -KMAX, hi = KMAX) {
 function phantomStops() {
   const turning = Math.abs(kT - k) > 1e-4;
   let dir = turning ? Math.sign(kT - k) : lensUI.dir;
-  if (stopToward(dir) === null) dir = -dir;              // at the end of the lens the only way is back
-  return { strong: stopToward(dir), faint: stopToward(-dir), dir };
+  const km = kmaxOf();
+  if (stopToward(dir, k, -km, km) === null) dir = -dir;   // at the end of the lens the only way is back
+  return { strong: stopToward(dir, k, -km, km), faint: stopToward(-dir, k, -km, km), dir };
 }
 
 // Label collision solver. Each label hangs off its anchor on a paper leader at least 24 px long (1440 frame), and its
@@ -1237,7 +1253,7 @@ function layerAnchor(ch, kk, tx0, ty0, door) {
 }
 
 const sheetInk = () => state === 'title' ? INK[0] : state === 'end' ? INK5 : state === 'brief' ? PAPER.cream : INK[(L ? li : 0) % 4];
-const nextInk = () => li + 1 < LEVELS.length ? INK[(li + 1) % 4] : INK5;
+const nextInk = () => li + 1 !== LEVELS.length ? INK[(li + 1) % 4] : INK5;   // after FIG. 10, the grant's ink
 const labelCol = () => { const s = sheetInk(); return s === INK[0] || s === PAPER.cream ? PAPER.black : PAPER.white; };
 let hoverDial = false, numRatio = 0.72;
 // The patent apparatus is on every sheet: every part present carries its numeral (FIRST is kept only for the
@@ -1355,7 +1371,7 @@ function drawPull() {
   fx.under = nextInk();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = fx.under; ctx.fillRect(0, 0, Wd, Hd);
-  if (li + 1 < LEVELS.length) {
+  if (li + 1 !== LEVELS.length) {
     setBase(); ctx.font = bs(NUMG.hgt / numRatio, 900); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = PAPER.cream;
     ctx.fillText(String(li + 2), NUMG.x, NUMG.top + NUMG.hgt);
     fx.pulled = li + 1;
@@ -1464,7 +1480,9 @@ const tintOf = ink => mixHex(ink, lightInk(ink) ? '#000000' : '#ffffff', lightIn
 function titleLayout() {
   const b = WP.band; if (!b || !L) return null;
   if (L.title && L.title.key === `${b.top}|${b.bot}|${b.x1}|${WP.Z}`) return L.title;
-  const sm = JPX(13), txt = `SHEET ${li + 1} OF ${LEVELS.length} · ${L.name}`;
+  const sm = JPX(13), txt = li >= LEVELS.length && cip.run
+    ? `SHEET ${li + 1} · CONTINUATION-IN-PART · SER. NO. ${cip.run.seed} · ${L.name} · ${nw(cip.run.cleared, 'CLAIM', 'CLAIMS').toUpperCase()} ALLOWED`
+    : `SHEET ${li + 1} OF ${LEVELS.length} · ${L.name}`;
   ctx.font = bs(sm, 800);
   const tw = ctx.measureText(txt).width;
   // keep clear of the cords (they hang through the band from the top of the frame)
@@ -1904,7 +1922,8 @@ function drawHud(ph, lc) {
   ctx.font = bs(24, 900); ctx.fillText(stop > 0 ? `+${stop}` : stop < 0 ? `–${-stop}` : '0', cx, cy + r + 28);
   ctx.fillStyle = PAPER.black; ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
   ctx.fillStyle = PAPER.cream;
-  for (let v = -KMAX; v <= KMAX; v++) { const a = ang(v), l = v ? 7 : 11; strip(cx + Math.cos(a) * (r - l), cy + Math.sin(a) * (r - l), cx + Math.cos(a) * (r - 2), cy + Math.sin(a) * (r - 2), v ? 2 : 3, v ? 2 : 3); }
+  // the dial keeps its scale; a continuation sheet's narrower lens simply has fewer notches
+  for (let v = -kmaxOf(); v <= kmaxOf(); v++) { const a = ang(v), l = v ? 7 : 11; strip(cx + Math.cos(a) * (r - l), cy + Math.sin(a) * (r - l), cx + Math.cos(a) * (r - 2), cy + Math.sin(a) * (r - 2), v ? 2 : 3, v ? 2 : 3); }
   if (ph) {
     ctx.strokeStyle = PAPER.cream; ctx.lineWidth = 2.5; ctx.setLineDash([5, 3]);
     for (const [st, al] of [[ph.faint, PHANTOM_FAINT], [ph.strong, 1]]) {
@@ -2055,7 +2074,7 @@ function drawCover() {
   const lc = PAPER.black, P = cover.pieces, S = VIEW.S, D = COVER_DEPTH, small = tooSmall();
   const age = fx.cut && fx.cut.kind === 'title' ? fx.cut.age : 9;
   setBaseD(D.numeral);
-  bigNumeral(String(best + 1), age, 0, { x: 34, top: 62, hgt: 420 });
+  bigNumeral(SEED_Q !== null ? String(CIP_N0) : String(best + 1), age, 0, { x: 34, top: 62, hgt: 420 });
   // the title, cut from black paper
   setBaseD(D.title);
   ctx.fillStyle = lc; ctx.font = bs(84, 900); ctx.textAlign = 'right'; ctx.textBaseline = 'alphabetic';
@@ -2065,6 +2084,13 @@ function drawCover() {
   if (dropIn(3)) {
     ctx.font = cp(18, 700); ctx.fillStyle = PH_LIGHT.run;                // an ink, not paper: the post pass gives it no shadow
     COVER_RULES.forEach((t, i) => ctx.fillText(t, 930, 164 + i * 25));
+  }
+  // ?seed=: this cover opens a continuation-in-part under that serial number (a caption over the title)
+  if (SEED_Q !== null) {
+    const b = cip.best[SEED_Q];
+    setBaseD(D.title); ctx.fillStyle = lc; ctx.font = bs(20, 800); ctx.textAlign = 'right';
+    ctx.fillText(`CONTINUATION-IN-PART · SER. NO. ${SEED_Q}${b ? ` · BEST FIG. ${b}` : ''}${cip.pending ? ' · FILING…' : ''}`, 930, 46);
+    setBase();
   }
   const put = (c, x, y, d) => { const [sx, sy] = lampShift(d); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(c, Math.round(VIEW.offX + (x + sx) * S), Math.round(VIEW.offY + (y + sy) * S)); };
   const u = [dropIn(0), dropIn(1), dropIn(2)];
@@ -2289,7 +2315,7 @@ function briefLines(txt, maxW) {
 }
 function openBrief() {
   snapCard('in');
-  brief.from = state; brief.sel = state === 'title' ? best : li; brief.hover = -1;
+  brief.from = state; brief.sel = state === 'title' ? best : Math.min(li, briefN() - 1); brief.hover = -1;
   if (state === 'title') coverReset();
   state = 'brief'; keys.clear(); cut('brief'); updateText();
   if (fx.esc) fx.cut.age = -ESC_DELAY;           // the page's own heading and rows start once its card is down
@@ -2303,18 +2329,21 @@ function closeBrief() {
 function openSheet(i) {
   jumpTo(i, i => { if (brief.from === 'title' || brief.from === 'end' || !L) startGame(i); else loadLevel(i); });
 }
+// With a continuation on file the page closes up (a 38 px heading, rows of 36 from y 80) to make room for its block.
+const briefGeo = () => cip.run ? { head: 56, rule: 66, y: 80, row: 36, hs: 38 } : { head: 82, rule: 98, y: BRIEF_Y, row: BRIEF_ROW, hs: 46 };
+const briefN = () => LEVELS.length + (cip.run ? 1 : 0);
 function drawBrief() {
   setBase();
-  const age = fx.cut && fx.cut.kind === 'brief' ? fx.cut.age : 9, s = slam(age);
+  const age = fx.cut && fx.cut.kind === 'brief' ? fx.cut.age : 9, s = slam(age), bg = briefGeo();
   ctx.fillStyle = PAPER.black; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
   // the heading is stamped in with the rows, from the card's first frame (never an empty page)
   if (RM || age >= 0) {
     const hs = RM ? 1 : 1 + 0.12 * (1 - slam(age, 0.09, 0.03));
-    ctx.save(); ctx.translate(48, 82); ctx.scale(hs, hs);
-    ctx.font = bs(46, 900); ctx.fillText('BRIEF DESCRIPTION OF THE DRAWINGS', 0, 0); ctx.restore();
-    ctx.fillRect(48, 98, 864 * s, 4);
+    ctx.save(); ctx.translate(48, bg.head); ctx.scale(hs, hs);
+    ctx.font = bs(bg.hs, 900); ctx.fillText('BRIEF DESCRIPTION OF THE DRAWINGS', 0, 0); ctx.restore();
+    ctx.fillRect(48, bg.rule, 864 * s, 4);
   }
-  const cur = brief.from === 'title' || brief.from === 'end' || !L ? -1 : li;
+  const cur = brief.from === 'title' || brief.from === 'end' || !L ? -1 : Math.min(li, LEVELS.length);
   const lh = BRIEF_FS * LONG_LH;
   for (let i = 0; i < LEVELS.length; i++) {
     // each row is stamped in: it arrives scaled up and settles on the signature curve, 25 ms after the one above,
@@ -2322,7 +2351,7 @@ function drawBrief() {
     const t0 = RM ? 0 : BRIEF_ROW_T0 + i * BRIEF_STAGGER, a = age - t0;
     if (!RM && a < 0) continue;
     const sc = RM ? 1 : 1 + 0.22 * (1 - slam(a, 0.09, 0.03));
-    const y = BRIEF_Y + i * BRIEF_ROW, on = i === brief.sel || i === brief.hover;
+    const y = bg.y + i * bg.row, on = i === brief.sel || i === brief.hover;
     ctx.save(); ctx.translate(480, y + 15.5); ctx.scale(sc, sc); ctx.translate(-480, -(y + 15.5));
     const claim = claimBody(i, true), reached = i <= best || !!claim, al = reached ? 1 : 0.42;
     chip(48, y, 44, 31, INK[i % 4], String(i + 1), al);           // the swatches stand in one column; selection is the underline
@@ -2347,15 +2376,45 @@ function drawBrief() {
     }
     ctx.restore();
   }
-  if (dropIn(3)) keyCaps([[levelKeys()], 'SHEET', ['ESC'], 'RETURN', ['C'], 'COVER'], 912, 518, PAPER.black, PAPER.black, PAPER.cream);
+  if (cip.run) drawBriefCip(bg, age, cur, lh);
+  if (dropIn(3)) keyCaps([[levelKeys()], 'SHEET', ['ESC'], 'RETURN', ['C'], 'COVER'], 912, cip.run ? 524 : 518, PAPER.black, PAPER.black, PAPER.cream);
+}
+// The continuation's block under the ten: CONTINUATION-IN-PART · SER. NO. · FIG. 11-n, the claims allowed and the
+// best depth for this serial number, then the latest lines (one per sheet, typed). Enter / a click resumes the run.
+function drawBriefCip(bg, age, cur, lh) {
+  const r = cip.run, i = LEVELS.length, y = bg.y + i * bg.row + 2, t0 = RM ? 0 : BRIEF_ROW_T0 + i * BRIEF_STAGGER;
+  if (!RM && age < t0) return;
+  const sc = RM ? 1 : 1 + 0.22 * (1 - slam(age - t0, 0.09, 0.03)), on = brief.sel === i || brief.hover === i;
+  ctx.save(); ctx.translate(480, y + 15.5); ctx.scale(sc, sc); ctx.translate(-480, -(y + 15.5));
+  ctx.fillStyle = PAPER.black; ctx.fillRect(48, y - 4, 864, 2);
+  chip(48, y + 2, 44, 31, INK[(r.at - 1) % 4], 'C', 1);
+  if (cur === i) tri(40, y + 17.5, 0, 14);
+  ctx.fillStyle = PAPER.black; ctx.textAlign = 'left'; ctx.font = bs(25, 900);
+  const head = 'CONTINUATION-IN-PART';
+  ctx.fillText(head, 108, y + 28);
+  if (on) ctx.fillRect(108, y + 31, ctx.measureText(head).width, 2.5);
+  const best = cip.best[r.seed] || 0, last = Math.max(CIP_N0, r.at);
+  ctx.font = cp(BRIEF_FS, 700); ctx.fillStyle = TEXT_DARK;
+  ctx.fillText(`SER. NO. ${r.seed} · FIG. ${CIP_N0}–${last} · ${nw(r.cleared, 'claim', 'claims')} allowed${best ? ` · best FIG. ${best}` : ''}`, 352, y + 23);
+  // the latest lines: the last sheet allowed, then the one on file now
+  const ns = Object.keys(r.recs).map(Number).sort((a, b) => a - b).slice(-1);
+  const lines = ns.map(n => `FIG. ${n} ${r.recs[n].name}: ${cipClaim(n, true)}`);
+  if (!r.recs[r.at]) { const d = defAt(r.at - 1); lines.push(`FIG. ${r.at} ${d ? d.name : ''}: [pending]`); }
+  ctx.font = cp(BRIEF_FS, 400);
+  lines.slice(-2).forEach((t, j) => {
+    let txt = t; while (ctx.measureText(txt).width > 912 - 108 && txt.length > 8) txt = txt.slice(0, -2).trimEnd() + '…';
+    ctx.fillText(txt, 108, y + 45.5 + j * lh);
+  });
+  ctx.restore();
 }
 function briefRowAt(bx, by) {
-  const i = Math.floor((by - BRIEF_Y + 3) / BRIEF_ROW);
-  return bx > 40 && bx < 920 && i >= 0 && i < LEVELS.length && by - BRIEF_Y - i * BRIEF_ROW < 36 ? i : -1;
+  const bg = briefGeo(), i = Math.floor((by - bg.y + 3) / bg.row);
+  if (cip.run && bx > 40 && bx < 920 && i >= LEVELS.length && by < bg.y + LEVELS.length * bg.row + 96) return LEVELS.length;
+  return bx > 40 && bx < 920 && i >= 0 && i < LEVELS.length && by - bg.y - i * bg.row < 36 ? i : -1;
 }
 
 // The end: LETTERS PATENT on the fifth ink, the ten claims typed one per beat, an embossed seal, the totals.
-const SAVE_BTN = [520, 488, 236, 40];
+const SAVE_BTN = [316, 488, 212, 40], CONT_BTN = [540, 488, 380, 40];   // the continuation is filed from the grant
 function drawGrant(age, ui) {
   setBase();
   const s = RM ? 1 : slam(age, 0.12), cr = PAPER.cream, done = filed();
@@ -2388,16 +2447,24 @@ function drawGrant(age, ui) {
     const w2 = ctx.measureText(String(dd)).width;
     ctx.font = bs(15, 800); ctx.fillText('TOTAL TIME', 40, 482); ctx.fillText(dd === 1 ? 'ATTEMPT ANTICIPATED' : 'ATTEMPTS ANTICIPATED', 40 + w1 + 46, 482);
     if (ui) {
-      const [bx, by, bw, bh] = SAVE_BTN, hot = brief.hover === 99;
-      lift(bx + bw / 2, by + bh / 2, bw / 2, bh / 2, 0, hot ? 5 : 2);
-      setBase();
-      ctx.fillStyle = cr; ctx.fillRect(bx - (hot ? 2 : 0), by - (hot ? 2 : 0), bw, bh);
-      ctx.fillStyle = PAPER.black; ctx.fillRect(bx + 8 - (hot ? 2 : 0), by + 8 - (hot ? 2 : 0), 24, 24);
-      ctx.fillStyle = cr; ctx.font = bs(18, 800); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(K('KeyS'), bx + 20 - (hot ? 2 : 0), by + 21 - (hot ? 2 : 0));
-      ctx.fillStyle = PAPER.black; ctx.font = bs(23, 900); ctx.fillText('SAVE THE PATENT', bx + 20 + (bw - 20) / 2 - (hot ? 2 : 0), by + 21 - (hot ? 2 : 0));
-      ctx.textBaseline = 'alphabetic';
-      keyCaps([['R'], 'NEW FILING'], 920, 508, cr);
+      // two paper buttons: SAVE THE PATENT (cream) and FILE A CONTINUATION (black, carrying the serial number it
+      // will be filed under); R for a new filing sits on the heading's rule
+      const btn = ([bx, by, bw, bh], hot, paper, ink, cap, txt, sub) => {
+        const o = hot ? 2 : 0;
+        lift(bx + bw / 2, by + bh / 2, bw / 2, bh / 2, 0, hot ? 5 : 2);
+        setBase();
+        ctx.fillStyle = paper; ctx.fillRect(bx - o, by - o, bw, bh);
+        ctx.fillStyle = ink; ctx.fillRect(bx + 8 - o, by + 8 - o, 24, 24);
+        ctx.fillStyle = paper; ctx.font = bs(18, 800); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(cap, bx + 20 - o, by + 21 - o);
+        ctx.fillStyle = ink; ctx.font = bs(23, 900); ctx.textAlign = 'left';
+        ctx.fillText(txt, bx + 42 - o, by + 21 - o);
+        if (sub) { ctx.font = bs(15, 800); ctx.textAlign = 'right'; ctx.fillText(sub, bx + bw - 12 - o, by + 22 - o); }
+        ctx.textBaseline = 'alphabetic';
+      };
+      btn(SAVE_BTN, brief.hover === 99, cr, PAPER.black, K('KeyS'), 'SAVE THE PATENT');
+      btn(CONT_BTN, brief.hover === 98, PAPER.black, cr, K('KeyC'), cip.pending ? 'FILING…' : 'FILE A CONTINUATION', `SER. NO. ${cip.pending && cip.run ? cip.run.seed : cip.seed}`);
+      keyCaps([['R'], 'NEW FILING'], 784, 120, cr);
     } else {
       ctx.fillStyle = cr; ctx.font = bs(15, 700); ctx.textAlign = 'right';
       ctx.fillText('GITHUB GAME OFF 2026 · THEME: SHIFT', 920, 516);
@@ -2472,6 +2539,100 @@ function newFiling() {
   filing = new Array(LEVELS.length).fill(null); saveFiling();
   startGame(0);
 }
+// ---- The continuation-in-part. After FIG. 10's grant the filing continues: FIG. 11, 12, ... are generated by
+// endless.js (seeded by the serial number, validated with this sim in a hidden ?validate frame, measured for
+// tolerance) and played here as ordinary sheets: the same ink cycle, numerals, phantoms, door 18, ANTICIPATED.
+// A run's score is its claims allowed (sheets cleared); the deepest FIG. cleared is kept per serial number.
+const CIP_KEY = 'chromatic-drift.cip', CIP_N0 = LEVELS.length + 1;          // FIG. 11
+const SEED_Q = (() => { const m = /[?&]seed=(\d{1,10})(?:[&#]|$)/.exec(location.search); return m ? (+m[1] >>> 0) : null; })();
+const cip = {
+  host: null, seed: SEED_Q !== null ? SEED_Q : CDX.randomSerial(),   // the serial number the next filing will carry
+  run: null,                     // { seed, recs: { n: record }, cleared, at }
+  results: {}, asked: {}, best: {}, pending: 0, urgent: false,
+};
+try { const b = JSON.parse(localStorage.getItem(CIP_KEY) || '{}'); if (b && typeof b === 'object' && !Array.isArray(b) && !TEST_MODE && !DEMO) cip.best = b; } catch (e) { /* none yet */ }
+const cipOn = () => !TEST_MODE && !DEMO && !VALIDATE;
+function cipWant(seed, n) {
+  const key = `${seed}:${n}`;
+  if (cip.results[key] || cip.asked[key] || !cipOn()) return;
+  cip.asked[key] = 1;
+  if (!cip.host) cip.host = CDX.host();
+  cip.host.request(seed, n).then(res => {
+    cip.results[key] = res;
+    if (cip.run && cip.run.seed === seed) CONT.set(n - 1, CDX.makeDef(res.data, rect));
+  });
+}
+// generate ahead: the sheet after this one and the one after that
+const cipPrefetch = (seed, from) => { cipWant(seed, from); cipWant(seed, from + 1); };
+function cipOnLoad() {
+  if (li === LEVELS.length - 1) cipPrefetch(cip.seed, CIP_N0);                  // FIG. 10: warm up the next filing
+  if (li >= LEVELS.length && cip.run) { cip.run.at = li + 1; cipPrefetch(cip.run.seed, li + 2); }
+}
+// FILE A CONTINUATION (the grant's C, or Space on a ?seed= cover): a new run under the pending serial number.
+function cipFile() {
+  if (!cipOn()) return;
+  const seed = cip.seed;
+  cip.run = { seed, recs: {}, cleared: 0, at: CIP_N0 };
+  CONT.clear();
+  for (const key in cip.results) { const [s0, n] = key.split(':').map(Number); if (s0 === seed) CONT.set(n - 1, CDX.makeDef(cip.results[key].data, rect)); }
+  cipPrefetch(seed, CIP_N0);
+  if (SEED_Q === null) cip.seed = CDX.randomSerial();       // the next filing gets its own serial number
+  cip.pending = CIP_N0;
+  sfx('thumpSoft');
+  cipReady();
+}
+// back into the run (the Brief's continuation line)
+function cipResume() { if (cip.run) { cip.pending = cip.run.at; cipReady(); } }
+function cipReady() {
+  if (!cip.pending || !CONT.has(cip.pending - 1)) return;
+  const n = cip.pending; cip.pending = 0;
+  if (state === 'brief') { brief.from = 'play'; openSheet(n - 1); }
+  else jumpTo(n - 1, state === 'title' || state === 'end' ? startGame : loadLevel);
+}
+// the sim asks for the next continuation sheet when ALLOWED has been pulled off; until it is filed, it holds
+function contAdvance(i) {
+  if (!cip.run || !CONT.has(i)) { cip.urgent = true; if (cip.run) cipWant(cip.run.seed, i + 1); return false; }
+  cip.urgent = false; loadLevel(i); return true;
+}
+function cipOnWin(rec) {
+  const r = cip.run; if (!r || !L.cip) return;
+  const n = li + 1, res = cip.results[`${r.seed}:${n}`];
+  r.recs[n] = { ...rec, n, name: L.name, beats: L.cip.beats, par: L.cip.par, pass: res ? res.pass : null, conn: CONN[r.cleared % CONN.length] };
+  r.cleared++;
+  if (TEST_MODE || DEMO || VALIDATE) return;
+  cip.best[r.seed] = Math.max(cip.best[r.seed] || 0, n);
+  try { localStorage.setItem(CIP_KEY, JSON.stringify(cip.best)); } catch (e) { /* private mode */ }
+}
+// the validator's share of each frame: 3 ms, more while someone is waiting on a sheet
+function cipTick() {
+  if (cip.host) cip.host.tick(cip.urgent || cip.pending ? 10 : 3);
+  if (cip.pending) cipReady();
+}
+
+// Continuation claims: one clause per beat, from the beat's own parameters and the run's measured events, and the
+// sheet's measured tolerance (sloppy runs passed out of nine) in the verdict.
+const CIP_MECH = {
+  LEAP: b => `12 was slid ${N(b.n)} beneath 10 in flight`,
+  RELAY: b => `lens 20 was wound back ${N(b.m)} while 10 stood on 12, then turned ${N(b.n)} in the air`,
+  SNARE: b => `10 was kept off spikes 14 by turning lens 20 ${N(b.m)} in a hop`,
+  TIDE: b => `water 16 was brought to a ledge ${nw(b.hL, 'row', 'rows')} up`,
+  LIFT: b => `12 was sunk ${N(b.n)} under 10 mid-jump${b.gap ? ` across ${nw(b.gap, 'tile', 'tiles')}` : ''}`,
+  STAIRS: b => `12 was sunk ${N(b.m)} under teeth 14 for headroom before a climb of ${N(b.n)}`,
+  CATCH: b => `12 was raised ${N(b.n)} to meet 10 falling ${nw(b.drop, 'row', 'rows')}`,
+  FLOOD: b => `sinking 12 ${N(b.n)} raised water 16 to the cliff`,
+};
+function cipClaim(n, short = false) {
+  const c = cip.run && cip.run.recs[n]; if (!c) return null;
+  const parts = c.beats.map(b => CIP_MECH[b.t](b));
+  const body = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
+  const tol = c.pass !== null && c.pass !== undefined ? c.pass : '?';
+  // the verdict from the run itself: the stops actually turned against the reference, the attempts anticipated
+  const v = c.d === 0 ? (c.steps <= c.par ? 'no alternative embodiment being required' : `the lens being turned ${N(c.steps)} where ${NUMW[c.par] || c.par} suffice`)
+    : `${nw(c.d, 'prior attempt being', 'prior attempts being')} anticipated`;
+  if (short) return `${c.conn} ${parts[0]}${parts.length > 1 ? `, +${parts.length - 1}` : ''}; tolerance ${tol}/9, ${c.d ? `${c.d} anticipated` : c.steps <= c.par ? 'allowed as filed' : `${c.steps} stops for ${c.par}`}.`;
+  return `The method of claim 1, ${c.conn} ${body}, ${v}, against a measured tolerance of ${tol} in nine.`;
+}
+
 function drawMuteMark() {
   setBase();
   // on a sheet the rail's foot holds the controls, so the mark stands just above them
@@ -2778,8 +2939,8 @@ addEventListener('keydown', e => {
   if (state === 'brief') {
     if (e.code === 'Escape') closeBrief();
     else if (pick !== null) openSheet(pick);
-    else if (e.code === 'ArrowDown' || e.code === 'ArrowUp') { brief.sel = (brief.sel + (e.code === 'ArrowDown' ? 1 : LEVELS.length - 1)) % LEVELS.length; brief.hover = -1; sfx('click'); }
-    else if (e.code === 'Enter' || e.code === 'Space' || e.code === 'NumpadEnter') openSheet(brief.sel);
+    else if (e.code === 'ArrowDown' || e.code === 'ArrowUp') { brief.sel = (brief.sel + (e.code === 'ArrowDown' ? 1 : briefN() - 1)) % briefN(); brief.hover = -1; sfx('click'); }
+    else if (e.code === 'Enter' || e.code === 'Space' || e.code === 'NumpadEnter') { if (brief.sel === LEVELS.length) cipResume(); else openSheet(brief.sel); }
     else if (e.code === 'KeyC') { snapCard('out'); toTitle(); }
     return;
   }
@@ -2787,11 +2948,12 @@ addEventListener('keydown', e => {
   if (state === 'title') {
     if (e.code === 'KeyQ' || e.code === 'KeyE') coverLens(e.code === 'KeyQ' ? 1 : -1, true);
     else if (pick !== null) jumpTo(pick, startGame);
-    else if (!IGNORED_ON_TITLE.includes(e.code)) startGame(best);
+    else if (!IGNORED_ON_TITLE.includes(e.code)) { if (SEED_Q !== null) cipFile(); else startGame(best); }
     return;
   }
   if (state === 'end') {
-    if (e.code === 'KeyR') newFiling();
+    if (e.code === 'KeyC') { if (fx.endAge > GRANT_T0) cipFile(); }
+    else if (e.code === 'KeyR') newFiling();
     else if (e.code === 'KeyS') savePatent();
     else if (pick !== null) jumpTo(pick, startGame);
     return;
@@ -2817,7 +2979,7 @@ function onWheel(e) {
     if (state === 'title') { coverLens(s, true); return; }
     if (fx.cut && fx.cut.kind === 'sheet' && fx.cut.go < 0) fx.cut.go = fx.cut.age;
     // horizontal: scroll down pushes red left; vertical: scroll down sinks red
-    kT = clamp(Math.round(kT) + (L && L.ay ? -s : s), -KMAX, KMAX);
+    kT = clamp(Math.round(kT) + (L && L.ay ? -s : s), -kmaxOf(), kmaxOf());
     lensUI.lastTouch = time; lensUI.dir = L && L.ay ? -s : s;
   }
 }
@@ -2825,13 +2987,15 @@ cv.addEventListener('wheel', onWheel, { passive: false });
 // Real wheels anywhere on the page (the WebGL canvas sits on top and ignores the pointer).
 addEventListener('wheel', e => { if (e.target !== cv) onWheel(e); }, { passive: false });
 const toBase = e => [(e.clientX - VIEW.cssX) / VIEW.cssS, (e.clientY - VIEW.cssY) / VIEW.cssS];
-const inBtn = (x, y) => x >= SAVE_BTN[0] && x <= SAVE_BTN[0] + SAVE_BTN[2] && y >= SAVE_BTN[1] && y <= SAVE_BTN[1] + SAVE_BTN[3];
+const inBtn = (x, y, b = SAVE_BTN) => x >= b[0] && x <= b[0] + b[2] && y >= b[1] && y <= b[1] + b[3];
 addEventListener('pointerdown', e => {
   initAudio(e); cv.focus({ preventScroll: true });
   const [x, y] = toBase(e);
-  if (state === 'title') { if (!tooSmall() && e.button === 0) startGame(best); return; }
-  if (state === 'brief') { const i = briefRowAt(x, y); if (i >= 0) openSheet(i); return; }
+  if (state === 'title') { if (!tooSmall() && e.button === 0) { if (SEED_Q !== null) cipFile(); else startGame(best); } return; }
+  if (state === 'title') return;
+  if (state === 'brief') { const i = briefRowAt(x, y); if (i === LEVELS.length) cipResume(); else if (i >= 0) openSheet(i); return; }
   if (state === 'end' && inBtn(x, y)) savePatent();
+  if (state === 'end' && inBtn(x, y, CONT_BTN) && fx.endAge > GRANT_T0) cipFile();
 });
 addEventListener('pointermove', e => {
   const [x, y] = toBase(e);
@@ -2839,7 +3003,7 @@ addEventListener('pointermove', e => {
   lamp.tx = clamp((e.clientX - innerWidth / 2) / (innerWidth / 2), -1, 1); lamp.ty = clamp((e.clientY - innerHeight / 2) / (innerHeight / 2), -1, 1); lamp.tw = 1;
   hoverDial = (state === 'play' || state === 'dead' || state === 'win') && Math.hypot(x - TB.dialX, y - TB.dialY) < TB.r + 8;
   const was = brief.hover;
-  brief.hover = state === 'brief' ? briefRowAt(x, y) : state === 'end' && inBtn(x, y) ? 99 : -1;
+  brief.hover = state === 'brief' ? briefRowAt(x, y) : state === 'end' && inBtn(x, y) ? 99 : state === 'end' && inBtn(x, y, CONT_BTN) ? 98 : -1;
   if (state === 'brief' && brief.hover >= 0 && brief.hover !== was) brief.sel = brief.hover;
   document.documentElement.dataset.hot = brief.hover >= 0 || (state === 'title' && !tooSmall()) ? '1' : '0';
 });
@@ -2963,6 +3127,9 @@ window.CD = {
   brief: () => openBrief(), toTitle: () => toTitle(),
   get filing() { return filing; }, setFiling(f) { filing = f; },
   claim: i => claimBody(i), end() { state = 'end'; updateText(); },
+  // the continuation: load a generated sheet by index (li 10 = FIG. 11); the run (QA)
+  loadDef(i, def) { CONT.set(i, def); loadLevel(i); },
+  get cip() { return cip; }, cipFile: () => cipFile(), cipClaim: (n, s) => cipClaim(n, s), get CONT() { return CONT; },
 };
 // QA (presentation only): every label's clearances in the last frame, in the jurors' 1440-frame px.
 window.__labelAudit = () => {
@@ -3014,58 +3181,71 @@ window.__wp = () => {
     titleClear: tob.every(b => b[1] + b[3] <= WP.f * T + 1e-6) };
 };
 
-layout();
-updateText();
-G = initGL();
-// Big Shoulders Display measures differently from the Impact fallback: size the huge numerals from the real glyph.
-const fontReady = (document.fonts && document.fonts.load ? Promise.all([document.fonts.load(bs(100, 900), '0123456789'), document.fonts.load(bs(100, 800), 'FIG.'), document.fonts.load(bs(20, 600), 'a'), document.fonts.load(cp(16, 400), 'a'), document.fonts.load(cp(16, 700), 'a')]) : Promise.resolve())
-  .catch(() => {}).then(() => {
-    ctx.font = bs(100, 900); ctx.textBaseline = 'alphabetic'; const m = ctx.measureText('1');
-    if (m.actualBoundingBoxAscent > 10) numRatio = m.actualBoundingBoxAscent / 100;
-  });
-
-// Adaptive tier: if WebGL2 is lost, or frames run slow for a sustained stretch with the post pass on,
-// drop to the Canvas2D drawing (the same sheet, without the paper pass).
-function dropGL(why) {
-  if (!G) return;
-  try { const ext = G.gl.getExtension('WEBGL_lose_context'); if (ext && why !== 'lost') ext.loseContext(); } catch (e) { /* already gone */ }
-  G = null; document.documentElement.dataset.gl = 'off'; window.__tier = `2d (${why})`;
-  console.info(`[chromatic-drift] paper pass off: ${why}`);
-}
-glc.addEventListener('webglcontextlost', e => { e.preventDefault(); dropGL('lost'); });
-window.__tier = G ? 'gl' : (GL_OFF ? '2d (gl-off)' : '2d (no webgl2)');
-
-if (FRAMES) {
-  // Nothing advances on its own: no rAF loop. The sim only moves inside step(), and the
-  // post pass renders exactly once per step, on virtual time.
+if (VALIDATE) {
+  // the continuation's validator: no frame loop, no drawing, nothing stored; endless.js steps the sim on request
   paused = true;
-  let vt = 0, steps = 0;
-  window.__frames = {
-    ready: fontReady.then(() => { render(); renderGL(); }),
-    step(ms) {
-      vt += ms;
-      const target = Math.floor(vt * 120 / 1000 + 1e-6);
-      while (steps < target) { simStep(); steps++; }
-      updateFx(ms / 1000); render(); renderGL();
-    },
-    time() { return vt; },
-  };
+  CDX.serve({
+    key: (type, code) => dispatchEvent(new KeyboardEvent(type, { code, bubbles: true, cancelable: true })),
+    wheel: dy => cv.dispatchEvent(new WheelEvent('wheel', { deltaY: dy, cancelable: true })),
+    step: () => update(DT), get p() { return p; }, get k() { return k; }, get state() { return state; },
+    get deaths() { return deaths; }, get axis() { return L.axis; },
+    load(i, def) { CONT.set(i, def); loadLevel(i); }, pause() { paused = true; keys.clear(); }, rect,
+  });
 } else {
-  let last = performance.now(), acc = 0, slow = 0, nFrames = 0;
-  const frame = now => {
-    const raw = (now - last) / 1000, rdt = Math.min(0.1, raw);
-    acc += rdt; last = now;
-    if (!paused) while (acc >= DT) { simStep(); acc -= DT; } else acc = 0;
-    updateFx(rdt); render(); renderGL(); updateAudio();
-    // ~1.5 s of frames slower than 40 fps while visible: the post pass goes.
-    if (G && !document.hidden && raw < 0.25) { nFrames++; if (nFrames > 90) slow = raw > 1 / 40 ? slow + 1 : Math.max(0, slow - 2); if (slow > 60) dropGL('slow frames'); }
+  layout();
+  updateText();
+  G = initGL();
+  if (SEED_Q !== null && !tooSmall()) cipPrefetch(SEED_Q, CIP_N0);     // ?seed=: FIG. 11 is filed while the cover is up
+  // Big Shoulders Display measures differently from the Impact fallback: size the huge numerals from the real glyph.
+  const fontReady = (document.fonts && document.fonts.load ? Promise.all([document.fonts.load(bs(100, 900), '0123456789'), document.fonts.load(bs(100, 800), 'FIG.'), document.fonts.load(bs(20, 600), 'a'), document.fonts.load(cp(16, 400), 'a'), document.fonts.load(cp(16, 700), 'a')]) : Promise.resolve())
+    .catch(() => {}).then(() => {
+      ctx.font = bs(100, 900); ctx.textBaseline = 'alphabetic'; const m = ctx.measureText('1');
+      if (m.actualBoundingBoxAscent > 10) numRatio = m.actualBoundingBoxAscent / 100;
+    });
+
+  // Adaptive tier: if WebGL2 is lost, or frames run slow for a sustained stretch with the post pass on,
+  // drop to the Canvas2D drawing (the same sheet, without the paper pass).
+  function dropGL(why) {
+    if (!G) return;
+    try { const ext = G.gl.getExtension('WEBGL_lose_context'); if (ext && why !== 'lost') ext.loseContext(); } catch (e) { /* already gone */ }
+    G = null; document.documentElement.dataset.gl = 'off'; window.__tier = `2d (${why})`;
+    console.info(`[chromatic-drift] paper pass off: ${why}`);
+  }
+  glc.addEventListener('webglcontextlost', e => { e.preventDefault(); dropGL('lost'); });
+  window.__tier = G ? 'gl' : (GL_OFF ? '2d (gl-off)' : '2d (no webgl2)');
+
+  if (FRAMES) {
+    // Nothing advances on its own: no rAF loop. The sim only moves inside step(), and the
+    // post pass renders exactly once per step, on virtual time.
+    paused = true;
+    let vt = 0, steps = 0;
+    window.__frames = {
+      ready: fontReady.then(() => { render(); renderGL(); }),
+      step(ms) {
+        vt += ms;
+        const target = Math.floor(vt * 120 / 1000 + 1e-6);
+        while (steps < target) { simStep(); steps++; }
+        updateFx(ms / 1000); render(); renderGL(); cipTick();
+      },
+      time() { return vt; },
+    };
+  } else {
+    let last = performance.now(), acc = 0, slow = 0, nFrames = 0;
+    const frame = now => {
+      const raw = (now - last) / 1000, rdt = Math.min(0.1, raw);
+      acc += rdt; last = now;
+      if (!paused) while (acc >= DT) { simStep(); acc -= DT; } else acc = 0;
+      updateFx(rdt); render(); renderGL(); updateAudio(); cipTick();
+      // ~1.5 s of frames slower than 40 fps while visible: the post pass goes.
+      if (G && !document.hidden && raw < 0.25) { nFrames++; if (nFrames > 90) slow = raw > 1 / 40 ? slow + 1 : Math.max(0, slow - 2); if (slow > 60) dropGL('slow frames'); }
+      requestAnimationFrame(frame);
+    };
     requestAnimationFrame(frame);
-  };
-  requestAnimationFrame(frame);
-  fontReady.then(() => { if (!document.hasFocus || document.hasFocus()) cv.focus({ preventScroll: true }); });
+    fontReady.then(() => { if (!document.hasFocus || document.hasFocus()) cv.focus({ preventScroll: true }); });
+  }
 }
 // ?test runs the automated playtest (playtest.js) against every level.
-if (TEST_MODE) {
+if (TEST_MODE && !VALIDATE) {
   const s = document.createElement('script'); s.src = 'playtest.js'; document.body.appendChild(s);
 }
 </script>
