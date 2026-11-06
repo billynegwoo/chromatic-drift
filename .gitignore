@@ -1,1 +1,18 @@
 .DS_Store
+.claude/
+baseline/
+teardown/
+board/
+checkpoints/
+dist/
+# heavy captures (screenshots, clips, frame dumps); the verdicts and reports stay tracked
+qa/shots/
+qa/r1/
+qa/r2/
+qa/r3/
+qa/r4/
+qa/jury/*/*.png
+qa/jury/*/*.jpg
+frames/capture/
+previs/capture/*/
+assets-src/moodboards/*/*-engine.*

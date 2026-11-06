@@ -1,0 +1,1626 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Title sequence style frame</title>
+<style>
+  @font-face {
+    font-family: "Big Shoulders Display";
+    src: url("../fonts/BigShouldersDisplay-wght600-900-sub.woff2") format("woff2");
+    font-weight: 600 900; font-display: block;
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #e08a1e; }
+  canvas { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; display: block; outline: none; }
+  #gl { pointer-events: none; display: none; }
+  html[data-gl="on"] #gl { display: block; }
+  html[data-gl="on"] #c { opacity: 0; }
+  /* Words stay in the DOM for screen readers; the screen itself carries only numerals and FIG. numbers. */
+  .sr { position: fixed; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="c" width="960" height="540" tabindex="0" aria-label="Chromatic Drift"></canvas>
+<canvas id="gl" aria-hidden="true"></canvas>
+<div id="hint" class="sr" aria-live="polite"></div>
+<div id="help" class="sr"></div>
+<script type="x-shader/x-fragment" id="glsl-lib">
+// Bundled from shader-skills (MIT): https://github.com/gokayfem/shader-skills
+// ---- shader-skills library: common ----
+const float TAU = 6.28318530717959;
+
+// ---- shader-skills library: hash ----
+// PCG-style 1D integer hash.
+uint pcgHash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+// 3D integer hash, three decorrelated outputs.
+uvec3 pcg3d(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return v;
+}
+// Map a uint to [0,1) using the top 24 bits, so the result can never round up to 1.0.
+float uintToUnit(uint h) { return float(h >> 8u) * (1.0 / 16777216.0); }
+vec2 uintToUnit(uvec2 h) { return vec2(h >> 8u) * (1.0 / 16777216.0); }
+vec3 uintToUnit(uvec3 h) { return vec3(h >> 8u) * (1.0 / 16777216.0); }
+vec4 uintToUnit(uvec4 h) { return vec4(h >> 8u) * (1.0 / 16777216.0); }
+// Random float in [0,1) for an integer-valued 2D input.
+float hash12(vec2 p) {
+    uvec2 q = uvec2(ivec2(floor(p)));
+    return uintToUnit(pcgHash(q.x + pcgHash(q.y)));
+}
+// Random vec3 in [0,1)^3 for an integer-valued 3D input.
+vec3 hash33(vec3 p) { return uintToUnit(pcg3d(uvec3(ivec3(floor(p))))); }
+
+// ---- shader-skills library: noise ----
+// Quintic fade 6t^5 - 15t^4 + 10t^3: C2-continuous interpolation weights for lattice noise.
+vec2 quinticFade(vec2 f) { return f * f * f * (f * (f * 6.0 - 15.0) + 10.0); }
+vec3 quinticFade(vec3 f) { return f * f * f * (f * (f * 6.0 - 15.0) + 10.0); }
+// Derivative of quinticFade: 30 t^2 (t - 1)^2.
+vec2 quinticFadeDeriv(vec2 f) { return 30.0 * f * f * (f * (f - 2.0) + 1.0); }
+vec3 quinticFadeDeriv(vec3 f) { return 30.0 * f * f * (f * (f - 2.0) + 1.0); }
+// Unit gradient for a 2D lattice point.
+vec2 latticeGradient(vec2 cell) {
+    float a = TAU * hash12(cell);
+    return vec2(cos(a), sin(a));
+}
+// 2D gradient (Perlin-style) noise with analytic derivatives. Returns vec3(value, d/dx, d/dy). Gradient noise has less grid-aligned blockiness than value noise. Prefer it for fBm.
+vec3 gradientNoiseD(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    vec2 u = quinticFade(f), du = quinticFadeDeriv(f);
+    vec2 ga = latticeGradient(i);
+    vec2 gb = latticeGradient(i + vec2(1.0, 0.0));
+    vec2 gc = latticeGradient(i + vec2(0.0, 1.0));
+    vec2 gd = latticeGradient(i + vec2(1.0, 1.0));
+    float va = dot(ga, f);
+    float vb = dot(gb, f - vec2(1.0, 0.0));
+    float vc = dot(gc, f - vec2(0.0, 1.0));
+    float vd = dot(gd, f - vec2(1.0, 1.0));
+    float k = va - vb - vc + vd;
+    float value = va + u.x * (vb - va) + u.y * (vc - va) + u.x * u.y * k;
+    vec2 deriv = ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd)
+               + du * (vec2(vb - va, vc - va) + u.yx * k);
+    return vec3(value, deriv);
+}
+// 2D gradient noise.
+float gradientNoise(vec2 p) { return gradientNoiseD(p).x; }
+// Dot product of a hashed 3D gradient with the offset to its lattice corner.
+float latticeGradDot(vec3 cell, vec3 corner, vec3 f) {
+    vec3 g = hash33(cell + corner) * 2.0 - 1.0;
+    return dot(g, f - corner);
+}
+// 3D gradient noise.
+float gradientNoise(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    vec3 u = quinticFade(f);
+    return mix(mix(mix(latticeGradDot(i, vec3(0, 0, 0), f), latticeGradDot(i, vec3(1, 0, 0), f), u.x),
+                   mix(latticeGradDot(i, vec3(0, 1, 0), f), latticeGradDot(i, vec3(1, 1, 0), f), u.x), u.y),
+               mix(mix(latticeGradDot(i, vec3(0, 0, 1), f), latticeGradDot(i, vec3(1, 0, 1), f), u.x),
+                   mix(latticeGradDot(i, vec3(0, 1, 1), f), latticeGradDot(i, vec3(1, 1, 1), f), u.x), u.y), u.z);
+}
+// 3D gradient noise with analytic derivatives. Returns vec4(value, d/dx, d/dy, d/dz); value equals gradientNoise(p). The trilinear blend is expanded as a polynomial in the fade weights, so the gradient is the same blend of the corner gradients plus the chain-rule term of the fade.
+vec4 gradientNoiseD(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    vec3 u = quinticFade(f), du = quinticFadeDeriv(f);
+    vec3 g000 = hash33(i) * 2.0 - 1.0;
+    vec3 g100 = hash33(i + vec3(1, 0, 0)) * 2.0 - 1.0;
+    vec3 g010 = hash33(i + vec3(0, 1, 0)) * 2.0 - 1.0;
+    vec3 g110 = hash33(i + vec3(1, 1, 0)) * 2.0 - 1.0;
+    vec3 g001 = hash33(i + vec3(0, 0, 1)) * 2.0 - 1.0;
+    vec3 g101 = hash33(i + vec3(1, 0, 1)) * 2.0 - 1.0;
+    vec3 g011 = hash33(i + vec3(0, 1, 1)) * 2.0 - 1.0;
+    vec3 g111 = hash33(i + vec3(1, 1, 1)) * 2.0 - 1.0;
+    float v000 = dot(g000, f);
+    float v100 = dot(g100, f - vec3(1, 0, 0));
+    float v010 = dot(g010, f - vec3(0, 1, 0));
+    float v110 = dot(g110, f - vec3(1, 1, 0));
+    float v001 = dot(g001, f - vec3(0, 0, 1));
+    float v101 = dot(g101, f - vec3(1, 0, 1));
+    float v011 = dot(g011, f - vec3(0, 1, 1));
+    float v111 = dot(g111, f - vec3(1, 1, 1));
+    // value = v000 + kx u.x + ky u.y + kz u.z + kxy u.x u.y + kyz u.y u.z + kzx u.z u.x + kxyz u.x u.y u.z
+    float kx = v100 - v000, ky = v010 - v000, kz = v001 - v000;
+    float kxy = v000 - v100 - v010 + v110;
+    float kyz = v000 - v010 - v001 + v011;
+    float kzx = v000 - v100 - v001 + v101;
+    float kxyz = -v000 + v100 + v010 - v110 + v001 - v101 - v011 + v111;
+    float value = v000 + kx * u.x + ky * u.y + kz * u.z
+                + kxy * u.x * u.y + kyz * u.y * u.z + kzx * u.z * u.x + kxyz * u.x * u.y * u.z;
+    vec3 grad = g000 + (g100 - g000) * u.x + (g010 - g000) * u.y + (g001 - g000) * u.z
+              + (g000 - g100 - g010 + g110) * u.x * u.y
+              + (g000 - g010 - g001 + g011) * u.y * u.z
+              + (g000 - g100 - g001 + g101) * u.z * u.x
+              + (-g000 + g100 + g010 - g110 + g001 - g101 - g011 + g111) * u.x * u.y * u.z
+              + du * vec3(kx + kxy * u.y + kzx * u.z + kxyz * u.y * u.z,
+                          ky + kxy * u.x + kyz * u.z + kxyz * u.x * u.z,
+                          kz + kyz * u.y + kzx * u.x + kxyz * u.x * u.y);
+    return vec4(value, grad);
+}
+const int FBM_MAX_OCTAVES = 12;
+// Fractional Brownian motion over 2D gradient noise. Each octave is rotated to hide lattice alignment. persistence 0.5 is the classic look (H = 1). Lower is smoother, higher is rougher.
+float fbm(vec2 p, int octaves, float lacunarity, float persistence) {
+    const mat2 octaveRotation = mat2(0.8, 0.6, -0.6, 0.8);
+    float sum = 0.0, amp = 1.0, norm = 0.0;
+    for (int i = 0; i < FBM_MAX_OCTAVES; i++) {
+        if (i >= octaves) break;
+        sum += amp * gradientNoise(p);
+        norm += amp;
+        amp *= persistence;
+        p = lacunarity * (octaveRotation * p) + vec2(17.13, -3.71);
+    }
+    return 1.4 * sum / norm;
+}
+// 2D fBm with the usual defaults (lacunarity 2.01 so octave peaks never re-align, persistence 0.5).
+float fbm(vec2 p, int octaves) { return fbm(p, octaves, 2.01, 0.5); }
+// fBm over 3D gradient noise.
+float fbm(vec3 p, int octaves, float lacunarity, float persistence) {
+    const mat3 octaveRotation = mat3(0.00, 0.80, 0.60,
+                                     -0.80, 0.36, -0.48,
+                                     -0.60, -0.48, 0.64);
+    float sum = 0.0, amp = 1.0, norm = 0.0;
+    for (int i = 0; i < FBM_MAX_OCTAVES; i++) {
+        if (i >= octaves) break;
+        sum += amp * gradientNoise(p);
+        norm += amp;
+        amp *= persistence;
+        p = lacunarity * (octaveRotation * p) + vec3(17.13, -3.71, 5.29);
+    }
+    return sum / norm;
+}
+</script>
+<script>
+'use strict';
+// Chromatic Drift — prototype
+// Three tile layers (R, G, B) composited additively. One "lens" value k slides
+// red by -k tiles and blue by +k tiles along the level's axis (x or y); green
+// is the fixed anchor.
+//   red   = solid ground (you are red, you collide only with red)
+//   green = lethal
+//   blue  = water (hold jump to swim)
+//   exit  = a door that only exists where all three channels overlap (white)
+// Standing on red, the lens carries you. Red moving into you shoves you.
+// Levels are authored in screen tile coords as seen at k = 0 (x 0..23, y 0..13);
+// grids are PAD tiles larger on every side so layers can slide in from offscreen.
+// Everything in `fx` is presentation only and never feeds back into the
+// simulation, so the deterministic playtest (index.html?test) is unaffected.
+const T = 32, COLS = 24, ROWS = 14, PAD = 4, MW = COLS + PAD * 2, MH = ROWS + PAD * 2;
+const W = COLS * T, H = ROWS * T, KMAX = 4, DT = 1 / 120;
+const GRAV = 1800, JUMP = 620, SPEED = 170, ACC = 2400;
+const LENS_KEY_RATE = 6, LENS_MAX_RATE = 10, ALIGN_TOL = 0.12;
+const SPIKE_UP = 1, SPIKE_DOWN = 2, BLOCK = 3;
+const SAVE_KEY = 'chromatic-drift.best';
+const TEST_MODE = /[?&]test\b/.test(location.search);   // playtest visits every level; don't save that
+const ST = new Set(new URLSearchParams(location.search).getAll('__state').flatMap(v => v.split(',')));
+const FRAMES = ST.has('frames'), DEMO = /[?&]demo\b/.test(location.search), GL_OFF = ST.has('gl-off'), POST_OFF = ST.has('post-off');
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d', { alpha: false });
+const hintEl = document.getElementById('hint'), helpEl = document.getElementById('help');
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// Layout-aware key labels (AZERTY shows A/E for the lens, Z to jump, etc.)
+const labels = { KeyQ: 'Q', KeyE: 'E', KeyA: 'A', KeyD: 'D', KeyW: 'W', KeyR: 'R', KeyM: 'M' };
+const K = c => labels[c] || c;
+if (navigator.keyboard && navigator.keyboard.getLayoutMap) {
+  navigator.keyboard.getLayoutMap().then(m => {
+    for (const c in labels) { const v = m.get(c); if (v) labels[c] = v.toUpperCase(); }
+    updateText();
+  }).catch(() => {});
+}
+
+const grid = () => new Uint8Array(MW * MH);
+// Fill a rectangle given in screen tiles at k = 0 (may extend PAD tiles offscreen).
+function rect(g, x0, y0, x1, y1, v = 1) {
+  for (let y = y0 + PAD; y <= y1 + PAD; y++) for (let x = x0 + PAD; x <= x1 + PAD; x++)
+    if (x >= 0 && x < MW && y >= 0 && y < MH) g[y * MW + x] = v;
+}
+const cell = (g, x, y) => (x < 0 || x >= MW || y < 0 || y >= MH) ? 0 : g[y * MW + x];
+// Does the world-space box overlap any tile of grid g drawn at pixel offset (ox, oy)?
+function hits(g, ox, oy, x, y, w, h) {
+  const x0 = Math.floor((x - ox) / T), x1 = Math.floor((x + w - 0.01 - ox) / T);
+  const y0 = Math.floor((y - oy) / T), y1 = Math.floor((y + h - 0.01 - oy) / T);
+  for (let yy = y0; yy <= y1; yy++) for (let xx = x0; xx <= x1; xx++) if (cell(g, xx, yy)) return true;
+  return false;
+}
+
+// axis: which way the lens slides layers. kd: lens value that aligns the exit.
+const LEVELS = [
+  {
+    name: 'LENS', axis: 'x', k0: 0, kd: 2, door: { x: 18, y: 10 }, spawn: { x: 3, y: 11 },
+    hint: () => `Turn the lens with ${K('KeyQ')} / ${K('KeyE')} or the mouse wheel. The exit only opens where red, green and blue overlap into white.`,
+    build(R, G, B) { rect(R, -4, 12, 27, 17); },
+  },
+  {
+    name: 'LEAP', axis: 'x', k0: 0, kd: 1, door: { x: 21, y: 10 }, spawn: { x: 2, y: 11 },
+    hint: () => `On red ground you ride the layer. In mid-air you don't: jump, then turn the lens to slide the far ledge under you. Green is lethal.`,
+    build(R, G, B) {
+      rect(R, -4, 12, 6, 17);          // left ledge
+      rect(R, 13, 12, 27, 17);         // right ledge: 6-tile gap, too far to jump
+      rect(G, 14, 11, 15, 11);         // spikes (green never moves)
+    },
+  },
+  {
+    name: 'TIDE', axis: 'x', k0: 0, kd: -1, door: { x: 15, y: 4 }, spawn: { x: 2, y: 11 },
+    hint: () => `Blue is water: hold jump to swim. Red and blue drift in opposite directions.`,
+    build(R, G, B) {
+      rect(R, -4, 12, 27, 17);         // floor
+      rect(R, 13, 6, 19, 6);           // high ledge
+      rect(B, 6, 4, 8, 11);            // water column
+      rect(G, 12, 11, 20, 11);         // spike bed under the ledge
+    },
+  },
+  {
+    // Starts at k=1 so only +3 is left: enough for one 6-tile gap, not two.
+    name: 'RELAY', axis: 'x', k0: 1, kd: 2, door: { x: 21, y: 10 }, spawn: { x: 1, y: 11 },
+    hint: () => `The lens only turns so far. While you stand on red, turning it back costs you nothing: you just ride along.`,
+    build(R, G, B) {
+      rect(R, -4, 12, 3, 17);          // start
+      rect(R, 10, 12, 14, 17);         // middle island (6-tile gaps on both sides)
+      rect(R, 21, 12, 27, 17);         // exit island
+    },
+  },
+  {
+    // The pit is 15 tiles: too wide even with a mid-air lens. Water never carries
+    // you, so you swim along while the lens moves the pocket (6 tiles/s vs 5.3 swim).
+    // You walk in mid-depth, so there's ~0.5 s of sinking before you'd drop out.
+    name: 'FERRY', axis: 'x', k0: -4, kd: 2, door: { x: 20, y: 5 }, spawn: { x: 1, y: 9 },
+    hint: () => `Too far to leap. Climb into the water and take it with you. It won't wait if you turn too fast.`,
+    build(R, G, B) {
+      rect(R, -4, 10, 0, 17);          // start ledge (world 0..4 at k=-4)
+      rect(B, 9, 6, 12, 11);           // floating pocket of water, 4 wide
+      rect(R, 17, 7, 27, 17);          // far cliff, arrives next to the pocket at k=2
+      rect(G, 5, 13, 14, 13);          // spikes along the pit floor
+    },
+  },
+  {
+    name: 'LIFT', axis: 'y', k0: 0, kd: 3, door: { x: 20, y: 3 }, spawn: { x: 3, y: 11 },
+    hint: () => `This lens turns up and down. Wall too high? Jump, then sink the world under your feet. Mind what hangs overhead before you rise.`,
+    build(R, G, B) {
+      rect(R, -4, 12, 11, 17);         // floor
+      rect(R, 12, 8, 27, 17);          // tower: 4 tiles up, one more than a jump
+      rect(G, 12, 0, 16, 3, BLOCK);    // hanging green block...
+      rect(G, 12, 4, 16, 4, SPIKE_DOWN); // ...with teeth
+    },
+  },
+  {
+    // The landing is offscreen until red rises. Raising it while still on the
+    // start ledge lifts you into the teeth, so it has to happen mid-fall.
+    name: 'CATCH', axis: 'y', k0: 0, kd: 3, door: { x: 13, y: 10 }, spawn: { x: 1, y: 3 },
+    hint: () => `Red pushes, too. Step off into the dark, then bring the floor up to catch you.`,
+    build(R, G, B) {
+      rect(R, -4, 4, 4, 5);            // start ledge
+      rect(G, 0, 0, 5, 0, BLOCK);
+      rect(G, 0, 1, 5, 1, SPIKE_DOWN); // teeth one lens step above your head
+      rect(R, 7, 15, 15, 17);          // landing, below the screen at k=0
+    },
+  },
+  {
+    name: 'FLOOD', axis: 'y', k0: 0, kd: 2, door: { x: 20, y: 2 }, spawn: { x: 3, y: 9 },
+    hint: () => `Sinking the red raises the water.`,
+    build(R, G, B) {
+      rect(R, -4, 10, 7, 17);          // shore
+      rect(R, 8, 11, 15, 17);          // pool floor
+      rect(B, 8, 9, 15, 17);           // pool
+      rect(R, 16, 6, 27, 17);          // cliff, 4 above the shore
+      rect(G, 16, 0, 18, 2, BLOCK);
+      rect(G, 16, 3, 18, 3, SPIKE_DOWN);
+    },
+  },
+  {
+    // Each jump-and-sink climb leaves you ~3 rows higher on screen. Jumping from
+    // the second step at k=1 puts your head in the teeth: sink while standing first.
+    name: 'STAIRS', axis: 'y', k0: 3, kd: -2, door: { x: 16, y: 2 }, spawn: { x: 2, y: 10 },
+    hint: () => `Every climb brings you closer to the teeth. Sink while you stand to make headroom.`,
+    build(R, G, B) {
+      rect(R, -4, 14, 5, 17);          // floor
+      rect(R, 6, 10, 9, 17);           // step 1 (each step 4 rows up)
+      rect(R, 10, 6, 13, 17);          // step 2
+      rect(R, 14, 2, 27, 17);          // top step with the exit
+      rect(G, 6, 0, 13, 0, BLOCK);
+      rect(G, 6, 1, 13, 1, SPIKE_DOWN);
+    },
+  },
+  {
+    name: 'PRISM', axis: 'x', k0: 0, kd: 2, door: { x: 20, y: 3 }, spawn: { x: 2, y: 11 },
+    hint: () => `Everything you've learned, in one room.`,
+    build(R, G, B) {
+      rect(R, -4, 12, 8, 17);          // start
+      rect(B, 4, 3, 6, 11);            // water column
+      rect(R, 12, 5, 16, 5);           // first high ledge
+      rect(R, 22, 5, 27, 5);           // exit ledge (5-tile gap)
+      rect(G, 22, 4, 23, 4);           // spikes past the exit
+      rect(G, 9, 13, 21, 13);          // spike pit
+    },
+  },
+];
+
+let li = 0, L = null, k = 0, kT = 0, p = null, state = 'title', stT = 0, deaths = 0, time = 0, runT = 0;
+let jumpBuf = 0, resistShake = 0, lastResist = -1, wheelAcc = 0, wheelT = -1, paused = false, deathAt = null;
+let wasAligned = false;
+// Pixel offset of a layer: s = -1 red, 0 green, +1 blue.
+const offs = (s, kk) => [(-PAD + s * kk * L.ax) * T, (-PAD + s * kk * L.ay) * T];
+
+let best = 0;
+try { best = clamp(parseInt(localStorage.getItem(SAVE_KEY), 10) || 0, 0, LEVELS.length - 1); } catch (e) { best = 0; }
+function saveBest(i) {
+  if (TEST_MODE || DEMO) return;
+  best = Math.max(best, i);
+  try { localStorage.setItem(SAVE_KEY, String(best)); } catch (e) { /* private mode: progress just isn't kept */ }
+}
+
+function loadLevel(i) {
+  li = i;
+  const d = LEVELS[i], R = grid(), G = grid(), B = grid();
+  d.build(R, G, B);
+  const ax = d.axis === 'y' ? 0 : 1, ay = 1 - ax;
+  // Door thirds sit wherever they need to be so they meet at d.door when k = kd.
+  const layers = [
+    makeLayer(R, 0, { x: d.door.x + d.kd * ax, y: d.door.y + d.kd * ay }),
+    makeLayer(G, 1, d.door),
+    makeLayer(B, 2, { x: d.door.x - d.kd * ax, y: d.door.y - d.kd * ay }),
+  ];
+  L = { ...d, R, G, B, ax, ay, layers, glows: layers.map(makeGlow) };
+  saveBest(i);
+  fx.intro = 1; fx.banner = 1.8; fx.parts.length = 0;
+  resetLevel(); updateText(); onLoadLevel();
+}
+function resetLevel() {
+  k = kT = L.k0;
+  p = { w: 20, h: 26, vx: 0, vy: 0, face: 1, grounded: true, coyote: 0, wet: null };
+  p.x = L.spawn.x * T + (T - p.w) / 2;
+  p.y = (L.spawn.y + 1) * T - p.h;
+  state = 'play'; jumpBuf = 0; deathAt = null;
+  wasAligned = Math.abs(k - L.kd) < ALIGN_TOL;
+  fx.spawn = 0.35; fx.trail.length = 0; fx.kPrev = k; fx.kVel = 0; onReset();
+}
+function startGame(i) { deaths = 0; runT = 0; loadLevel(i); }
+const levelKeys = () => LEVELS.length >= 10 ? '1–9, 0' : `1–${LEVELS.length}`;
+function updateText() {
+  hintEl.textContent = state === 'title' ? 'A lens-shifting puzzle platformer · GitHub Game Off 2026 · theme: SHIFT'
+    : state === 'end' ? 'End of the prototype. Thanks for playing!' : (L ? L.hint() : '');
+  helpEl.textContent = `${K('KeyA')}/${K('KeyD')} or ←/→ move · ${K('KeyW')}/↑/Space jump · ${K('KeyQ')}/${K('KeyE')} or wheel: lens · ${K('KeyR')} restart · ${K('KeyM')} mute · ${levelKeys()} level select · Esc title`;
+}
+
+const redHit = (x, y, kk = k) => { const [ox, oy] = offs(-1, kk); return hits(L.R, ox, oy, x, y, p.w, p.h); };
+const solid = (x, y) => x < 0 || x + p.w > W || redHit(x, y);
+function move(axis, d) {               // 1px sub-steps; returns true on collision
+  const n = Math.ceil(Math.abs(d)), s = n ? d / n : 0;
+  for (let i = 0; i < n; i++) {
+    if (axis === 0) { p.x += s; if (solid(p.x, p.y)) { p.x -= s; return true; } }
+    else            { p.y += s; if (solid(p.x, p.y)) { p.y -= s; return true; } }
+  }
+  return false;
+}
+// Move the lens. Standing on red carries you; red sliding into you shoves you.
+// The lens only refuses when that would push you off the screen.
+function applyK(nk) {
+  const [ox0, oy0] = offs(-1, k), [ox1, oy1] = offs(-1, nk);
+  const nx = p.x + ox1 - ox0, ny = p.y + oy1 - oy0;
+  const inBounds = nx >= 0 && nx + p.w <= W && ny >= -0.5 && ny + p.h <= H + 0.5;
+  if (p.grounded || redHit(p.x, p.y, nk)) {
+    if (!inBounds || redHit(nx, ny, nk)) return false;
+    p.x = nx; p.y = ny;
+  }
+  k = nk; return true;
+}
+function die() {
+  deaths++; state = 'dead'; stT = 0.6; deathAt = { x: p.x + p.w / 2, y: p.y + p.h / 2 };
+  sfx('die'); juice.die();
+}
+
+const keys = new Set();
+const JUMP_KEYS = ['KeyW', 'ArrowUp', 'Space'];
+
+function update(dt) {
+  time += dt; resistShake = Math.max(0, resistShake - dt); jumpBuf -= dt;
+  if (state === 'dead' || state === 'win') {
+    stT -= dt;
+    if (stT <= 0) {
+      if (state === 'dead') resetLevel();
+      else if (li + 1 < LEVELS.length) loadLevel(li + 1);
+      else { state = 'end'; updateText(); }
+    }
+    return;
+  }
+  if (state !== 'play') return;
+  runT += dt;
+
+  // lens
+  const q = keys.has('KeyQ'), e = keys.has('KeyE');
+  if (q && !e) kT += LENS_KEY_RATE * dt;
+  else if (e && !q) kT -= LENS_KEY_RATE * dt;
+  else kT = Math.round(kT);                       // soft detents on whole tiles
+  kT = clamp(kT, -KMAX, KMAX);
+  const kBefore = k;
+  const dk = clamp(kT - k, -LENS_MAX_RATE * dt, LENS_MAX_RATE * dt);
+  if (Math.abs(dk) > 1e-6 && !applyK(k + dk)) {
+    kT = k;
+    if (q || e || time - wheelT < 0.3) {
+      resistShake = 0.18;
+      if (time - lastResist > 0.25) { lastResist = time; sfx('resist'); }
+    }
+  }
+  if (k > kBefore ? Math.floor(k) !== Math.floor(kBefore) : k < kBefore && Math.ceil(k) !== Math.ceil(kBefore)) juice.tick(Math.round(k));
+
+  // player
+  const left = keys.has('KeyA') || keys.has('ArrowLeft'), right = keys.has('KeyD') || keys.has('ArrowRight');
+  const jumpHeld = JUMP_KEYS.some(c => keys.has(c));
+  const ax = (right ? 1 : 0) - (left ? 1 : 0);
+  p.vx += clamp(ax * SPEED - p.vx, -ACC * dt, ACC * dt);
+  if (ax) p.face = ax;
+  const [bx, by] = offs(1, k);
+  const inWater = hits(L.B, bx, by, p.x + 2, p.y + 2, p.w - 4, p.h - 2);
+  if (p.wet !== null && p.wet !== inWater) juice.splash(inWater);
+  p.wet = inWater;
+  if (inWater) {
+    p.vy += GRAV * 0.3 * dt;
+    if (jumpHeld) p.vy -= 1500 * dt;
+    p.vy = clamp(p.vy, -230, 170);
+  } else {
+    p.vy += GRAV * dt;
+    if (!jumpHeld && p.vy < 0) p.vy += GRAV * 1.2 * dt;   // short hop on early release
+    p.vy = Math.min(p.vy, 900);
+  }
+  p.coyote = p.grounded ? 0.09 : p.coyote - dt;
+  if (jumpBuf > 0 && p.coyote > 0 && !inWater) { p.vy = -JUMP; p.coyote = 0; jumpBuf = 0; sfx('jump'); juice.jump(); }
+  const wasGrounded = p.grounded, impact = p.vy;
+  if (move(0, p.vx * dt)) p.vx = 0;
+  if (move(1, p.vy * dt)) p.vy = 0;
+  p.grounded = solid(p.x, p.y + 1);
+  if (!wasGrounded && p.grounded && impact > 220) juice.land(impact);
+
+  // hazards + exit
+  const ins = 4, [gx, gy] = offs(0, k);
+  if (hits(L.G, gx, gy, p.x + ins, p.y + ins, p.w - 2 * ins, p.h - ins) || p.y > H) return die();
+  const aligned = Math.abs(k - L.kd) < ALIGN_TOL;
+  if (aligned && !wasAligned) juice.align();
+  wasAligned = aligned;
+  if (aligned) {
+    const dx = L.door.x * T, dy = L.door.y * T;
+    if (p.x < dx + T - 4 && p.x + p.w > dx + 4 && p.y < dy + 2 * T && p.y + p.h > dy + 4) {
+      state = 'win'; stT = 1.1; sfx('win'); juice.win();
+    }
+  }
+}
+
+
+// Direction B, "Title sequence": the patent's figures re-cut as 1950s title-card paper.
+// Everything below is presentation only. It reads the sim, never writes to it, so
+// index.html?test and this file's ?test give the same results.
+if (DEMO) best = 0;                                   // the demo always opens on FIG. 1's card
+const RM = ST.has('reduced-motion') || matchMedia('(prefers-reduced-motion: reduce)').matches;
+const INK = ['#e08a1e', '#3f5a6b', '#7a2a26', '#6b6a2a'];          // ochre, slate, oxblood, olive
+const PAPER = { black: '#141210', cream: '#efe6d2', red: '#c9372c', green: '#2f8f4e', blue: '#2c5aa8', white: '#fbf6ea' };
+const LAYER_COL = [PAPER.red, PAPER.green, PAPER.blue];
+const FONT = '"Big Shoulders Display", Impact, "Arial Narrow", sans-serif';
+const bs = (px, w = 800) => `${w} ${px}px ${FONT}`;
+const OX = 40, OY = 46, CW = 960, CH = 540;
+const SLIT_P = 16, SLIT_W = 5, BORDER = 6;            // stripes cut into each layer, in its hatching direction
+const PHANTOM_FAINT = 0.28, FREEZE = 6 / 60, LEADER_T = 0.4, CIRCLE_T = 0.18;
+const FIRST = { 10: 0, 12: 0, 18: 0, 14: 1, 16: 2 };  // a numeral appears on the sheet where its part first does
+
+// Signature curve cubic-bezier(0.32, 0.72, 0, 1) for arrivals; exits ease in (power2.in).
+function bezier(x1, y1, x2, y2) {
+  const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx, cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+  const X = u => ((ax * u + bx) * u + cx) * u, DX = u => (3 * ax * u + 2 * bx) * u + cx, Y = u => ((ay * u + by) * u + cy) * u;
+  return t => {
+    t = clamp(t, 0, 1); let u = t;
+    for (let i = 0; i < 8; i++) { const e = X(u) - t, d = DX(u); if (Math.abs(e) < 1e-6 || Math.abs(d) < 1e-6) break; u -= e / d; }
+    if (u < 0 || u > 1 || Math.abs(X(u) - t) > 1e-4) { let lo = 0, hi = 1; u = t; for (let i = 0; i < 30; i++) { if (X(u) < t) lo = u; else hi = u; u = (lo + hi) / 2; } }
+    return Y(clamp(u, 0, 1));
+  };
+}
+const SIG = bezier(0.32, 0.72, 0, 1);
+// Slam in from off-frame: arrive over 120 ms on the signature curve, overshooting 4% of the travel.
+function slam(age, dur = 0.12, over = 0.04) {
+  if (RM || age >= dur) return 1;
+  const u = clamp(age / dur, 0, 1);
+  return u < 0.72 ? (1 + over) * SIG(u / 0.72) : 1 + over * (1 - SIG((u - 0.72) / 0.28));
+}
+
+// The 2D frame is drawn at device resolution over the whole viewport; 960x540 is the safe area.
+const VIEW = { S: 1, offX: 0, offY: 0, w: CW, h: CH, cssS: 1, cssX: 0, cssY: 0 };
+function layout() {
+  const vw = Math.max(1, innerWidth), vh = Math.max(1, innerHeight);
+  const cssS = Math.min(vw / CW, vh / CH);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2, 2.5 / cssS);
+  const w = Math.round(vw * dpr), h = Math.round(vh * dpr), S = cssS * dpr;
+  const changed = Math.abs(S - VIEW.S) > 1e-6 || w !== VIEW.w || h !== VIEW.h || !cover.pieces;
+  Object.assign(VIEW, { S, w, h, cssS, offX: Math.round((w - CW * S) / 2), offY: Math.round((h - CH * S) / 2),
+    cssX: (vw - CW * cssS) / 2, cssY: (vh - CH * cssS) / 2 });
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  if (changed) { buildCover(); if (L) rebuildLayers(); }
+}
+const setBase = () => ctx.setTransform(VIEW.S, 0, 0, VIEW.S, VIEW.offX, VIEW.offY);
+const setWorld = () => ctx.setTransform(VIEW.S, 0, 0, VIEW.S, VIEW.offX + OX * VIEW.S, VIEW.offY + OY * VIEW.S);
+const devX = wx => Math.round(VIEW.offX + (OX + wx) * VIEW.S), devY = wy => Math.round(VIEW.offY + (OY + wy) * VIEW.S);
+
+function mkCanvas(wl, hl) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(wl * VIEW.S); c.height = Math.ceil(hl * VIEW.S);
+  const x = c.getContext('2d'); x.scale(VIEW.S, VIEW.S);
+  return [c, x];
+}
+// Slits in the Patent Office hatching directions: red vertical, blue horizontal, green diagonal.
+function slitLines(x, dir, w, h, pitch = SLIT_P) {
+  x.beginPath();
+  if (dir === 0) for (let i = pitch / 2; i < w; i += pitch) { x.moveTo(i, -2); x.lineTo(i, h + 2); }
+  else if (dir === 2) for (let i = pitch / 2; i < h; i += pitch) { x.moveTo(-2, i); x.lineTo(w + 2, i); }
+  else for (let i = -h; i < w + h; i += pitch * 1.3) { x.moveTo(i, h + 2); x.lineTo(i + h + 4, -2); }
+  x.stroke();
+}
+// Cut slits out of everything already on (x), but not within BORDER of the edges in (edges).
+function cutSlits(x, wl, hl, fill, edges, dir, border = BORDER, pitch = SLIT_P, sw = SLIT_W) {
+  const [s, z] = mkCanvas(wl, hl);
+  z.save(); z.clip(fill); z.strokeStyle = '#000'; z.lineWidth = sw; slitLines(z, dir, wl, hl, pitch); z.restore();
+  z.globalCompositeOperation = 'destination-out'; z.strokeStyle = '#000'; z.lineWidth = border * 2; z.lineJoin = 'miter';
+  for (const e of edges) z.stroke(e);
+  x.save(); x.setTransform(1, 0, 0, 1, 0, 0); x.globalCompositeOperation = 'destination-out'; x.drawImage(s, 0, 0); x.restore();
+}
+function cutPiece(wl, hl, col, dir, opts = {}) {
+  const [c, x] = mkCanvas(wl, hl), P = new Path2D();
+  P.rect(0, 0, wl, hl);
+  x.fillStyle = col; x.fill(P);
+  if (dir !== null) cutSlits(x, wl, hl, P, [P], dir, opts.border || BORDER, opts.pitch || SLIT_P, opts.sw || SLIT_W);
+  return c;
+}
+function boundaryPath(isOn) {
+  const P = new Path2D();
+  for (let y = 0; y <= MH; y++) {
+    let run = -1;
+    for (let x = 0; x <= MW; x++) {
+      const e = x < MW && isOn(x, y) !== isOn(x, y - 1);
+      if (e && run < 0) run = x;
+      if (!e && run >= 0) { P.moveTo(run * T, y * T); P.lineTo(x * T, y * T); run = -1; }
+    }
+  }
+  for (let x = 0; x <= MW; x++) {
+    let run = -1;
+    for (let y = 0; y <= MH; y++) {
+      const e = y < MH && isOn(x, y) !== isOn(x - 1, y);
+      if (e && run < 0) run = y;
+      if (!e && run >= 0) { P.moveTo(x * T, run * T); P.lineTo(x * T, y * T); run = -1; }
+    }
+  }
+  return P;
+}
+// Teeth: two per tile, cut from the green sheet (the sim's hit box is still the whole tile).
+function teethPath(px, py, down) {
+  const P = new Path2D(), n = 2, w = T / n;
+  for (let i = 0; i < n; i++) {
+    if (down) { P.moveTo(px + i * w, py); P.lineTo(px + i * w + w / 2, py + T - 3); P.lineTo(px + (i + 1) * w, py); }
+    else      { P.moveTo(px + i * w, py + T); P.lineTo(px + i * w + w / 2, py + 3); P.lineTo(px + (i + 1) * w, py + T); }
+    P.closePath();
+  }
+  return P;
+}
+function makeLayer(g, ch, door) {
+  const WL = MW * T, HL = MH * T, col = LAYER_COL[ch];
+  const [c, x] = mkCanvas(WL, HL);
+  const isRect = (tx, ty) => { const v = cell(g, tx, ty); return !!v && (ch !== 1 || v === BLOCK); };
+  const area = new Path2D(), teeth = new Path2D();
+  let cells = 0;
+  for (let ty = 0; ty < MH; ty++) for (let tx = 0; tx < MW; tx++) {
+    const v = cell(g, tx, ty);
+    if (!v) continue;
+    cells++;
+    if (isRect(tx, ty)) area.rect(tx * T, ty * T, T, T);
+    else teeth.addPath(teethPath(tx * T, ty * T, v === SPIKE_DOWN));
+  }
+  const edge = boundaryPath(isRect);
+  const dx = (door.x + PAD) * T, dy = (door.y + PAD) * T, dp = new Path2D();
+  dp.rect(dx + 4, dy + 4, T - 8, 2 * T - 4);
+  const both = new Path2D(); both.addPath(area); both.addPath(dp);
+  // The solid version fills the band along the sheet's edge, so a part cut off by the edge of
+  // the figure still has a paper border there instead of a comb of open slits.
+  const [solid, sx] = mkCanvas(WL, HL);
+  sx.fillStyle = col; sx.fill(both); sx.fill(teeth);
+  x.fillStyle = col; x.fill(both);
+  cutSlits(x, WL, HL, both, [edge, dp], ch, BORDER);
+  x.fillStyle = col; x.fill(teeth);
+  c.solid = solid;
+  // Phantom: the same part at another lens stop, as a dashed paper-cut outline.
+  let ph = null;
+  if (ch !== 1) {
+    const [p2, y] = mkCanvas(WL, HL);
+    const pi = 4 + (ch === 2 ? 7 : 3.5), pdp = new Path2D();
+    pdp.rect(dx + pi, dy + pi, T - 2 * pi, 2 * T - pi - 1);
+    y.strokeStyle = col; y.lineWidth = 3.5; y.lineCap = 'butt'; y.setLineDash([10, 6]);
+    y.stroke(edge); y.stroke(teeth); y.stroke(pdp);
+    ph = p2;
+  }
+  c.ph = ph;
+  c.cells = cells;
+  c.door = [dx + T / 2, dy + 4];
+  c.tops = [];
+  for (let ty = 0; ty < MH; ty++) for (let tx = 0; tx < MW; tx++) if (cell(g, tx, ty) && !cell(g, tx, ty - 1))
+    c.tops.push([tx, ty, !cell(g, tx - 1, ty) ? -1 : !cell(g, tx + 1, ty) ? 1 : 0]);
+  return c;
+}
+function makeGlow() { return null; }
+function rebuildLayers() {
+  const d = L;
+  L.layers = [
+    makeLayer(L.R, 0, { x: d.door.x + d.kd * d.ax, y: d.door.y + d.kd * d.ay }),
+    makeLayer(L.G, 1, d.door),
+    makeLayer(L.B, 2, { x: d.door.x - d.kd * d.ax, y: d.door.y - d.kd * d.ay }),
+  ];
+}
+
+// The sim's loadLevel/resetLevel still write intro/banner/parts/trail.
+const fx = {
+  parts: [], trail: [], intro: 0, banner: 0, spawn: 0, kPrev: 0, kVel: 0,
+  clock: 0, alignAge: -1, dead: null, cut: null, cuts: 0, gate: 0, winAge: -1,
+  path: [], prior: [], pathT: 0, labelMemo: {},
+};
+// Lens preview bookkeeping, in sim seconds so it is identical in real time and under ?__state=frames.
+const lensUI = { lastTouch: -9, dir: 1 };
+const CUTS = {
+  sheet: { slam: true, beats: [0.12, 0.20, 0.28] },   // stamp thump, numeral slams (120 ms), three typewriter beats 80 ms apart
+  title: { slam: true, beats: [0.12, 0.20, 0.28] },
+  fast:  { slam: false, beats: [0.0, 0.04, 0.08] },   // R / death: the same cut, quick
+};
+function cut(kind) {
+  fx.cuts++;
+  fx.cut = { kind, age: 0, fired: 0 };
+  fx.gate = RM ? 0 : (fx.cuts % 2 ? 1 : -1);
+}
+function onLoadLevel() { fx.prior = []; fx.labelMemo = {}; cut('sheet'); }
+function onReset() { fx.path = []; fx.pathT = 0; fx.winAge = -1; cut('fast'); }
+const beatsOf = () => fx.cut ? CUTS[fx.cut.kind].beats.map(b => RM ? 0 : b) : [0, 0, 0];
+// 0 = not yet, 1 = settled. Beat i: 0 green, 1 red (+ runner), 2 blue, 3 furniture.
+function dropIn(i) {
+  if (!fx.cut || RM) return 1;
+  const b = beatsOf(), t0 = i < 3 ? b[i] : b[2] + 0.06, a = fx.cut.age - t0;
+  return a < 0 ? 0 : Math.max(0.001, Math.min(1, a / 0.07));
+}
+const dropPx = u => u >= 1 ? 0 : -14 * (1 - SIG(u));
+
+const juice = {
+  jump() { sfx('jump'); }, land(v) { sfx('land', v); }, splash() { sfx('splash'); }, tick() { sfx('click'); },
+  align() { sfx('pin'); },
+  die() { fx.prior.push(fx.path.concat([[p.x + p.w / 2, p.y + p.h / 2 + 2]])); sfx('rip'); },
+  win() { fx.winAge = 0; },
+};
+
+function updateFx(dt) {
+  fx.clock += dt;
+  const aligned = L && (state === 'play' || state === 'win') && Math.abs(k - L.kd) < ALIGN_TOL;
+  const a0 = fx.alignAge;
+  fx.alignAge = aligned ? (fx.alignAge < 0 ? 0 : fx.alignAge + dt) : -1;
+  if (aligned) {
+    const a = fx.alignAge;
+    if (a0 < 0) sfx('nib');                                          // the leader starts drawing
+    if (a0 < LEADER_T && a >= LEADER_T) sfx('type');                 // 1
+    if (a0 < LEADER_T + 0.07 && a >= LEADER_T + 0.07) sfx('type');   // 8
+  }
+  if (state === 'dead') {
+    if (!fx.dead) fx.dead = { age: 0, at: contactPoint() };
+    else {
+      const prev = fx.dead.age; fx.dead.age += dt;
+      const st = RM ? FREEZE : FREEZE + CIRCLE_T;
+      if (prev < st && fx.dead.age >= st) sfx('thump');               // ANTICIPATED lands
+    }
+  } else fx.dead = null;
+  if (fx.winAge >= 0) { if (fx.winAge === 0) sfx('thump'); fx.winAge += dt; }
+  if (fx.cut) {
+    const c = fx.cut, b = beatsOf();
+    if (!c.fired) { sfx(c.kind === 'fast' ? 'thumpSoft' : 'thump'); c.fired = 1; }
+    const prev = c.age; c.age += dt;
+    if (c.kind !== 'fast') b.forEach(t => { if (prev < t && c.age >= t) sfx('type'); });
+    if (c.age > 1.5) fx.cut = null;
+  }
+  if (state === 'play' && p) {
+    fx.pathT -= dt;
+    if (fx.pathT <= 0) { fx.pathT = 1 / 30; fx.path.push([p.x + p.w / 2, p.y + p.h / 2 + 2]); if (fx.path.length > 900) fx.path.shift(); }
+  }
+}
+// Centre of the overlap between the sim's hazard box (inset 4px, see update()) and green tiles.
+function contactPoint() {
+  const ins = 4, [gx, gy] = offs(0, k);
+  const bx = p.x + ins, by = p.y + ins, bw = p.w - 2 * ins, bh = p.h - ins;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let ty = Math.floor((by - gy) / T); ty <= Math.floor((by + bh - 0.01 - gy) / T); ty++)
+    for (let tx = Math.floor((bx - gx) / T); tx <= Math.floor((bx + bw - 0.01 - gx) / T); tx++) {
+      if (!cell(L.G, tx, ty)) continue;
+      const rx = tx * T + gx, ry = ty * T + gy;
+      x0 = Math.min(x0, Math.max(bx, rx)); y0 = Math.min(y0, Math.max(by, ry));
+      x1 = Math.max(x1, Math.min(bx + bw, rx + T)); y1 = Math.max(y1, Math.min(by + bh, ry + T));
+    }
+  if (x0 === Infinity) return { x: p.x + p.w / 2, y: H - 2, fell: true };
+  return { x: (x0 + x1) / 2, y: (y0 + y1) / 2, fell: false };
+}
+
+// Phantoms: the next stop in both directions, faint; the direction in use (or last used), strong.
+function stopToward(dir, kk = k, lo = -KMAX, hi = KMAX) {
+  const n = dir > 0 ? Math.floor(kk + 1e-4) + 1 : Math.ceil(kk - 1e-4) - 1;
+  return n < lo || n > hi ? null : n;
+}
+function phantomStops() {
+  const turning = Math.abs(kT - k) > 1e-4;
+  let dir = turning ? Math.sign(kT - k) : lensUI.dir;
+  if (stopToward(dir) === null) dir = -dir;              // at the end of the lens the only way is back
+  return { strong: stopToward(dir), faint: stopToward(-dir), dir };
+}
+
+// Label collision pass: each label sits beside its own anchor, on the side away from its
+// neighbour, never on another label or on the runner/door.
+const DIRS = [[-0.7, -0.7], [0.7, -0.7], [0, -1], [-1, 0], [1, 0], [-0.7, 0.7], [0.7, 0.7], [0, 1]];
+function placeLabels(list, obstacles, bounds) {
+  const placed = [];
+  for (const lb of list) {
+    ctx.font = bs(lb.size, 800);
+    const w = ctx.measureText(lb.txt).width + 4, h = lb.size * 0.78;
+    let best = null, bScore = Infinity;
+    DIRS.forEach(([dx, dy], i) => {
+      const dist = lb.dist || 26;
+      const cx = lb.x + dx * dist + dx * w / 2, cy = lb.y + dy * dist + dy * h / 2;
+      const box = [cx - w / 2, cy - h / 2, w, h];
+      let s = i * 0.4;
+      for (const q of placed) if (ovl(box, q.box, 5)) s += 1000;
+      for (const o of obstacles) if (ovl(box, o, 3)) s += 400;
+      if (box[0] < bounds[0] || box[1] < bounds[1] || box[0] + w > bounds[2] || box[1] + h > bounds[3]) s += 600;
+      if (lb.away) s -= 6 * (dx * lb.away[0] + dy * lb.away[1]);
+      if (dy >= 0 && lb.top) s += 3;                         // beside or under a top edge, a label sits on its own part
+      if (fx.labelMemo[lb.key] === i) s -= 3;              // hysteresis: don't flip sides frame to frame
+      if (s < bScore) { bScore = s; best = { box, dir: [dx, dy], i }; }
+    });
+    fx.labelMemo[lb.key] = best.i;
+    placed.push({ ...lb, ...best });
+  }
+  for (const q of placed) {
+    const [bx, by, w, h] = q.box, ex = clamp(q.x, bx, bx + w), ey = clamp(q.y, by, by + h);
+    ctx.fillStyle = q.col === PAPER.white && onNumeral(bx, by, w, h) ? PAPER.black : q.col;
+    if (Math.hypot(ex - q.x, ey - q.y) > 4) strip(ex, ey, q.x, q.y, 3.2, 0.8);    // leader: a thin paper strip
+    ctx.font = bs(q.size, 800); ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(q.txt, bx + w / 2, by + h);
+  }
+  return placed;
+}
+const ovl = (a, b, pad) => a[0] < b[0] + b[2] + pad && a[0] + a[2] + pad > b[0] && a[1] < b[1] + b[3] + pad && a[1] + a[3] + pad > b[1];
+function strip(x0, y0, x1, y1, w0, w1) {
+  const dx = x1 - x0, dy = y1 - y0, l = Math.hypot(dx, dy) || 1, nx = -dy / l, ny = dx / l;
+  ctx.beginPath();
+  ctx.moveTo(x0 + nx * w0 / 2, y0 + ny * w0 / 2); ctx.lineTo(x1 + nx * w1 / 2, y1 + ny * w1 / 2);
+  ctx.lineTo(x1 - nx * w1 / 2, y1 - ny * w1 / 2); ctx.lineTo(x0 - nx * w0 / 2, y0 - ny * w0 / 2);
+  ctx.closePath(); ctx.fill();
+}
+function tri(x, y, ang, s) {
+  ctx.beginPath(); ctx.moveTo(x, y);
+  ctx.lineTo(x - Math.cos(ang - 0.45) * s, y - Math.sin(ang - 0.45) * s);
+  ctx.lineTo(x - Math.cos(ang + 0.45) * s, y - Math.sin(ang + 0.45) * s);
+  ctx.closePath(); ctx.fill();
+}
+// Where to hang a layer's numeral: a visible top corner, else that layer's door part (phantoms only), else any top tile.
+function pickTop(ch, ox, oy, tx0, ty0, corners) {
+  let best = null, bd = Infinity;
+  for (const [tx, ty, side] of L.layers[ch].tops) {
+    if (corners && !side) continue;
+    const x = (side && corners ? tx + (side > 0 ? 1 : 0) : tx + 0.5) * T + ox, y = ty * T + oy;
+    if (x < 1.5 * T || x > W - 1.5 * T || y < T || y > H - T / 2) continue;
+    const d = (x - tx0) ** 2 + 4 * (y - ty0) ** 2;
+    if (d < bd) { bd = d; best = [x, y]; }
+  }
+  return best;
+}
+function layerAnchor(ch, kk, tx0, ty0, door) {
+  const [ox, oy] = offs(ch - 1, kk), dp = L.layers[ch].door, d = [dp[0] + ox, dp[1] + oy];
+  const doorOk = door && d[0] > T && d[0] < W - T && d[1] > T && d[1] < H;
+  return pickTop(ch, ox, oy, tx0, ty0, true) || (doorOk ? d : pickTop(ch, ox, oy, tx0, ty0, false));
+}
+
+const sheetInk = () => state === 'title' ? INK[0] : INK[(L ? li : 0) % 4];
+const labelCol = () => sheetInk() === INK[0] ? PAPER.black : PAPER.white;
+let hoverDial = false, numRatio = 0.72;
+function showNum(n) {
+  if (hoverDial || (fx.dead && fx.dead.age >= FREEZE)) return true;
+  return FIRST[n] === li;
+}
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1; ctx.setLineDash([]);
+  ctx.fillStyle = sheetInk(); ctx.fillRect(0, 0, cv.width, cv.height);
+  if (state === 'title') drawCover();
+  else if (state === 'end') drawEnd();
+  else drawSheet();
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.setLineDash([]);
+  if (!G) document.body.style.background = sheetInk();
+}
+// The sheet's huge FIG. numeral, behind everything like a title card.
+function bigNumeral(txt, x, top, hgt, age, col = PAPER.cream) {
+  const size = hgt / numRatio, s = fx.cut && fx.cut.kind !== 'fast' ? slam(age) : 1;
+  const travel = x + 0.62 * size * txt.length + 40;          // comes in from off the left edge
+  ctx.font = bs(size, 900); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = col;
+  ctx.fillText(txt, x - travel * (1 - s), top + hgt);
+  if (s === 1) numeralMask(txt, x, top, hgt, size);
+}
+// A coarse coverage grid of the settled FIG. numeral (4 logical px cells, world coords), so a
+// white numeral or dot that lands on the cream paper can switch to black paper instead.
+function numeralMask(txt, x, top, hgt, size) {
+  const key = `${txt}|${x}|${top}|${hgt}|${numRatio}`;
+  if (fx.numMask && fx.numMask.key === key) return;
+  const C = 4, w = Math.ceil((ctx.measureText(txt).width + 8) / C), h = Math.ceil((hgt + 8) / C);
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const m = c.getContext('2d', { willReadFrequently: true });
+  m.scale(1 / C, 1 / C); m.font = bs(size, 900); m.textBaseline = 'alphabetic'; m.fillStyle = '#000';
+  m.fillText(txt, 0, hgt);
+  const a = m.getImageData(0, 0, w, h).data, data = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) data[i] = a[i * 4 + 3] > 96 ? 1 : 0;
+  fx.numMask = { key, x0: x - OX, y0: top - OY, w, h, C, data };
+}
+function onNumeral(bx, by, bw = 0, bh = 0) {
+  const M = fx.numMask; if (!M || state === 'title') return false;
+  let n = 0, on = 0;
+  for (let y = by; y <= by + bh; y += M.C) for (let x = bx; x <= bx + bw; x += M.C) {
+    const cx = Math.floor((x - M.x0) / M.C), cy = Math.floor((y - M.y0) / M.C);
+    n++; if (cx >= 0 && cy >= 0 && cx < M.w && cy < M.h && M.data[cy * M.w + cx]) on++;
+  }
+  return n > 0 && on / n > 0.2;
+}
+function drawSheet() {
+  const dead = state === 'dead', lc = labelCol();
+  const furn = dropIn(3), showFurniture = furn > 0;
+  setBase();
+  bigNumeral(String(li + 1), 26, 58, 412, fx.cut ? fx.cut.age : 9);
+  if (showFurniture) { ctx.font = bs(30, 800); ctx.fillStyle = lc; ctx.textAlign = 'left'; ctx.fillText('FIG.', 30, 39); }
+
+  // the three layers drop in on three beats: green, red (with the runner), blue
+  for (const i of [1, 0, 2]) {
+    const u = dropIn([1, 0, 2].indexOf(i)); if (!u) continue;
+    const [ox, oy] = offs(i - 1, k);
+    drawLayer(L.layers[i], devX(ox), devY(oy + dropPx(u)));
+  }
+  setWorld();
+  const dx = L.door.x * T, dy = L.door.y * T, aligned = fx.alignAge >= 0;
+  if (aligned) { ctx.fillStyle = PAPER.white; ctx.fillRect(dx + 3, dy + 3, T - 6, 2 * T - 3); }
+
+  const ph = state === 'play' && showFurniture ? phantomStops() : null;
+  if (ph) {
+    const a = RM ? 1 : furn;
+    if (ph.faint !== null) drawPhantoms(ph.faint, a * PHANTOM_FAINT);
+    if (ph.strong !== null) drawPhantoms(ph.strong, a);
+  }
+  setWorld();
+  drawPrior(lc);
+  if (dropIn(1)) drawRunner(dead);
+  if (state === 'play' && !p.grounded && showFurniture) drawGapDimension(lc);
+  if (fx.dead && fx.dead.age >= FREEZE) drawDeathCircle(fx.dead, lc);
+
+  let stamp = null;
+  if (fx.dead && fx.dead.age >= (RM ? FREEZE : FREEZE + CIRCLE_T)) {
+    const c = fx.dead.at;
+    stamp = { word: 'ANTICIPATED', paper: PAPER.red, ink: PAPER.white, x: clamp(c.x + 20, 130, W - 130), y: clamp(c.y - 120, 40, H - 60), rot: -0.07, age: fx.dead.age - FREEZE - CIRCLE_T, sub: `CF. ATTEMPT ${deaths}` };
+  } else if (state === 'win' && fx.winAge >= 0) {
+    stamp = { word: 'ALLOWED', paper: PAPER.white, ink: PAPER.black, x: clamp(dx - 40, 100, W - 100), y: clamp(dy - 70, 40, H - 60), rot: 0.05, age: fx.winAge, sub: `FIG. ${li + 1}` };
+  }
+  // numerals: only where a part first appears (or on hover of the dial, or at a death)
+  if (showFurniture) {
+    const labels = [], obstacles = [[p.x - 3, p.y + 2, 26, 26]];
+    if (aligned) obstacles.push([dx - 4, dy - 4, T + 8, 2 * T + 8]);
+    const a10 = [p.x + p.w + 1, p.y + 5];
+    let a10p = null, a12 = null, a12p = null, a16 = null, a16p = null;
+    if (showNum(12)) a12 = layerAnchor(0, k, W * 0.4, H);
+    if (ph && ph.strong !== null && showNum(12)) a12p = layerAnchor(0, ph.strong, W * 0.55, H, true);
+    if (ph && ph.strong !== null && p.grounded && showNum(10)) {
+      const [a0, b0] = offs(-1, k), [a1, b1] = offs(-1, ph.strong);
+      a10p = [p.x + a1 - a0 + (a1 < a0 ? -1 : p.w + 1), p.y + b1 - b0 + 5];
+    }
+    if (showNum(16) && L.layers[2].cells) a16 = layerAnchor(2, k, W * 0.35, 0);
+    if (ph && ph.strong !== null && showNum(16) && L.layers[2].cells) a16p = layerAnchor(2, ph.strong, W * 0.6, 0, true);
+    const away = (a, b) => a && b ? norm(a[0] - b[0], a[1] - b[1]) : null;
+    if (showNum(10) && state !== 'win' && !(dead && fx.dead.age < FREEZE)) labels.push({ key: '10', txt: '10', x: a10[0], y: a10[1], away: away(a10, a10p), col: lc, size: 26 });
+    if (a12) labels.push({ key: '12', txt: '12', x: a12[0], y: a12[1], away: away(a12, a12p), col: lc, size: 26, top: true });
+    if (a10p) labels.push({ key: "10'", txt: "10′", x: a10p[0], y: a10p[1], away: away(a10p, a10), col: lc, size: 26 });
+    if (a12p) labels.push({ key: "12'", txt: "12′", x: a12p[0], y: a12p[1], away: away(a12p, a12), col: lc, size: 26 });
+    if (showNum(14) && L.layers[1].cells) {
+      const a14 = layerAnchor(1, 0, W * 0.6, H * 0.5);
+      if (a14) labels.push({ key: '14', txt: '14', x: a14[0], y: a14[1], col: lc, size: 26 });
+    }
+    if (a16) labels.push({ key: '16', txt: '16', x: a16[0], y: a16[1], away: away(a16, a16p), col: lc, size: 26, top: true });
+    if (a16p) labels.push({ key: "16'", txt: "16′", x: a16p[0], y: a16p[1], away: away(a16p, a16), col: lc, size: 26 });
+    if (aligned) obstacles.push(doorLeaderBox(dx, dy));
+    obstacles.push([W + 20, 30, 140, 230]);
+    if (stamp) obstacles.push([stamp.x - 125, stamp.y - 34, 250, 90]);
+    placeLabels(labels, obstacles, [-OX + 8, -OY + 6, CW - OX - 8, CH - OY - 6]);
+  }
+  if (aligned) drawDoorLeader(dx, dy, fx.alignAge, lc);
+  if (showFurniture) drawHud(ph, lc);
+  if (stamp) stampAt(stamp.word, stamp.paper, stamp.ink, stamp.x, stamp.y, stamp.rot, stamp.age, stamp.sub, lc);
+}
+const norm = (x, y) => { const l = Math.hypot(x, y) || 1; return [x / l, y / l]; };
+// The figure is cut to the world rectangle; inside a BORDER-wide band along that cut the
+// layer is drawn solid, so its slits stop short of the cut like they do at its own edges.
+function figureClip() {
+  const x0 = devX(0), y0 = devY(0);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.beginPath(); ctx.rect(x0, y0, devX(W) - x0, devY(H) - y0); ctx.clip();
+}
+function drawLayer(c, X, Y) {
+  ctx.save(); figureClip();
+  ctx.drawImage(c, X, Y);
+  const x0 = devX(0), y0 = devY(0), x1 = devX(W), y1 = devY(H), b = Math.round(BORDER * VIEW.S);
+  ctx.beginPath();
+  ctx.rect(x0, y0, x1 - x0, b); ctx.rect(x0, y1 - b, x1 - x0, b); ctx.rect(x0, y0, b, y1 - y0); ctx.rect(x1 - b, y0, b, y1 - y0);
+  ctx.clip();
+  ctx.drawImage(c.solid, X, Y);
+  ctx.restore();
+}
+function drawPhantoms(stop, alpha) {
+  ctx.save(); figureClip();
+  ctx.globalAlpha = alpha;
+  for (const [ch, s] of [[0, -1], [2, 1]]) {
+    const [ox, oy] = offs(s, stop);
+    ctx.drawImage(L.layers[ch].ph, devX(ox), devY(oy));
+  }
+  ctx.restore();
+  ctx.globalAlpha = alpha;
+  setWorld();
+  if (p.grounded) {
+    const [a0, b0] = offs(-1, k), [a1, b1] = offs(-1, stop);
+    ctx.strokeStyle = PAPER.black; ctx.lineWidth = 3.5; ctx.setLineDash([6, 4]);
+    ctx.strokeRect(p.x - 1 + a1 - a0 + 1.75, p.y + 4 + b1 - b0 + 1.75, 22 - 3.5, 22 - 3.5);
+    ctx.setLineDash([]);
+  }
+  ctx.globalAlpha = 1;
+}
+// The runner is a square of black paper. (Drawn 22 px; the sim's box is still 20 x 26.)
+function drawRunner(dead, x = p.x - 1, y = p.y + 4, s = 22, face = p.face) {
+  ctx.setLineDash([]);
+  ctx.fillStyle = PAPER.black; ctx.fillRect(x, y, s, s);
+  ctx.fillStyle = PAPER.white;
+  const e = s * 0.2;
+  ctx.fillRect(x + s / 2 + face * s * 0.18 - e / 2, y + s * 0.22, e, e);
+}
+function drawPrior(col) {
+  if (!fx.prior.length) return;
+  ctx.fillStyle = col; ctx.globalAlpha = 0.85;
+  for (const path of fx.prior) {
+    let acc = 0;
+    for (let i = 1; i < path.length; i++) {
+      const [x0, y0] = path[i - 1], [x1, y1] = path[i], l = Math.hypot(x1 - x0, y1 - y0);
+      let s = acc;
+      for (; s < l; s += 9) {
+        const u = s / l, x = x0 + (x1 - x0) * u, y = y0 + (y1 - y0) * u;
+        ctx.fillStyle = col === PAPER.white && onNumeral(x, y) ? PAPER.black : col;
+        ctx.beginPath(); ctx.arc(x, y, 2, 0, Math.PI * 2); ctx.fill();
+      }
+      acc = s - l;
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+// Airborne: you are not carried, so instead of a phantom runner, dimension the drop to red.
+function drawGapDimension(col) {
+  const [ox, oy] = offs(-1, k), y0 = p.y + p.h;
+  let d = 0;
+  for (let i = 1; i <= H - y0 + 2 * T; i++) if (hits(L.R, ox, oy, p.x, y0 + i - 1, p.w, 1)) { d = i - 1; break; }
+  if (d < 6) return;
+  dimension(p.x + p.w + 9, y0, y0 + d, col);
+}
+function dimension(x, y0, y1, col) {
+  ctx.fillStyle = col;
+  strip(x - 7, y0, x + 6, y0, 2, 2); strip(x - 7, y1, x + 6, y1, 2, 2);
+  strip(x, y0 + 7, x, y1 - 7, 2.2, 2.2);
+  tri(x, y0 + 1, -Math.PI / 2, 8); tri(x, y1 - 1, Math.PI / 2, 8);
+}
+function drawDeathCircle(d, col) {
+  const c = d.at, u = RM ? 1 : SIG((d.age - FREEZE) / CIRCLE_T), r = 19;
+  ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.lineCap = 'butt'; ctx.setLineDash([]);
+  ctx.beginPath(); ctx.ellipse(c.x, c.y, r + 3, r, -0.3, 0.3, 0.3 + (Math.PI * 2 + 0.6) * u); ctx.stroke();
+}
+function doorLeaderGeom(dx, dy) {
+  const cx = dx + T / 2, cy = dy + T;
+  const side = [['l', dx], ['r', W - dx - T], ['t', dy], ['b', H - dy - 2 * T]].sort((a, b) => a[1] - b[1])[0][0];
+  const m = 26;
+  const s = side === 'l' ? [-m, cy - 44] : side === 'r' ? [W + m - 6, cy - 44] : side === 't' ? [cx + 56, -m + 6] : [cx + 56, H + m];
+  const e = side === 'l' ? [dx + 3, cy] : side === 'r' ? [dx + T - 3, cy] : side === 't' ? [cx, dy + 4] : [cx + 4, dy + 2 * T - 6];
+  return { side, s, e };
+}
+function doorLeaderBox(dx, dy) {
+  const { side, s } = doorLeaderGeom(dx, dy);
+  return side === 'l' ? [s[0] - 44, s[1] - 18, 44, 36] : [s[0], s[1] - 18, 44, 36];
+}
+// The door is never numbered in advance: on alignment a paper strip draws in from the nearest
+// margin on the signature curve, then 1 and 8 slam in, 70 ms apart, on two typewriter strikes.
+function drawDoorLeader(dx, dy, age, col) {
+  const { side, s, e } = doorLeaderGeom(dx, dy);
+  const u = RM ? 1 : SIG(age / LEADER_T);
+  ctx.fillStyle = col;
+  strip(s[0], s[1], s[0] + (e[0] - s[0]) * u, s[1] + (e[1] - s[1]) * u, 3.4, 3.4 - 2.6 * u);
+  const left = side === 'l', x = left ? s[0] - 4 : s[0] + 4;
+  ctx.font = bs(36, 900); ctx.textBaseline = 'middle';
+  const w1 = ctx.measureText('1').width, w8 = ctx.measureText('8').width;
+  [['1', LEADER_T, left ? x - w8 - w1 : x, w1], ['8', LEADER_T + 0.07, left ? x - w8 : x + w1, w8]].forEach(([g, t0, gx, gw]) => {
+    const a = age - t0;
+    if (!RM && a < 0) return;
+    const sc = RM ? 1 : 1 + 0.6 * (1 - slam(a, 0.06, 0.04));
+    ctx.save(); ctx.translate(gx + gw / 2, s[1]); ctx.scale(sc, sc);
+    ctx.textAlign = 'center'; ctx.fillText(g, 0, 1); ctx.restore();
+  });
+}
+function stampAt(word, paper, ink, x, y, rot, age, sub, subCol) {
+  const sc = RM ? 1 : 1 + 0.35 * (1 - slam(Math.max(0, age), 0.08, 0.04));
+  setWorld(); ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(sc, sc);
+  ctx.font = bs(38, 900); const w = ctx.measureText(word).width + 24;
+  ctx.fillStyle = paper; ctx.fillRect(-w / 2, -24, w, 46);
+  ctx.fillStyle = ink; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(word, 0, 1);
+  ctx.font = bs(16, 700); ctx.fillStyle = subCol; ctx.fillText(sub, 0, 38);
+  ctx.restore();
+}
+// Dial 20 and arrows 22/24 in the margin: black paper, cream notches.
+function drawHud(ph, lc) {
+  setWorld();
+  const cx = W + 78, cy = 92, r = 38;
+  const ang = v => -Math.PI / 2 + v * (Math.PI * 0.75 / KMAX);
+  ctx.fillStyle = PAPER.black; ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = PAPER.cream;
+  for (let v = -KMAX; v <= KMAX; v++) { const a = ang(v), l = v ? 7 : 11; strip(cx + Math.cos(a) * (r - l), cy + Math.sin(a) * (r - l), cx + Math.cos(a) * (r - 2), cy + Math.sin(a) * (r - 2), v ? 2 : 3, v ? 2 : 3); }
+  if (ph) {
+    ctx.strokeStyle = PAPER.cream; ctx.lineWidth = 2.5; ctx.setLineDash([5, 3]);
+    for (const [st, al] of [[ph.faint, PHANTOM_FAINT], [ph.strong, 1]]) {
+      if (st === null) continue;
+      ctx.globalAlpha = al; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(ang(st)) * (r - 9), cy + Math.sin(ang(st)) * (r - 9)); ctx.stroke();
+    }
+    ctx.globalAlpha = 1; ctx.setLineDash([]);
+  }
+  ctx.fillStyle = PAPER.cream;
+  strip(cx, cy, cx + Math.cos(ang(k)) * (r - 9), cy + Math.sin(ang(k)) * (r - 9), 5, 2.4);
+  ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI * 2); ctx.fill();
+  // 22 / 24: which way red and blue go for the direction in use, along the level's axis
+  const dir = ph ? ph.dir : lensUI.dir;
+  [[0, -dir], [2, dir]].forEach(([ch, s], j) => {
+    ctx.fillStyle = LAYER_COL[ch];
+    if (L.ax) {
+      const y = 166 + j * 30, x0 = cx - 34, x1 = cx + 34, [a, b] = s > 0 ? [x0, x1 - 10] : [x1, x0 + 10];
+      stripedArrow(ch, a, y, b, y);
+    } else {
+      const x = cx - 18 + j * 36, y0 = 150, y1 = 222, [a, b] = s > 0 ? [y0, y1 - 10] : [y1, y0 + 10];
+      stripedArrow(ch, x, a, x, b);
+    }
+  });
+  if (hoverDial || (fx.dead && fx.dead.age >= FREEZE)) {
+    ctx.fillStyle = lc; ctx.font = bs(22, 800); ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left'; ctx.fillText('20', cx + r + 8, cy - r + 6);
+    if (L.ax) { ctx.textAlign = 'right'; ctx.fillText('22', cx - 42, 166); ctx.fillText('24', cx - 42, 196); }
+    else { ctx.textAlign = 'center'; ctx.fillText('22', cx - 18, 240); ctx.fillText('24', cx + 18, 240); }
+  }
+}
+// An arrow whose shaft is cut in its layer's hatching: red as vertical bars, blue as horizontal strips.
+function stripedArrow(ch, x0, y0, x1, y1) {
+  const l = Math.hypot(x1 - x0, y1 - y0), ux = (x1 - x0) / l, uy = (y1 - y0) / l, horiz = Math.abs(ux) > 0.5;
+  if ((ch === 0) === horiz) {
+    for (let s = 0; s < l - 2; s += 7) { const x = x0 + ux * s, y = y0 + uy * s; if (horiz) ctx.fillRect(x - 1.5, y - 6, 4, 12); else ctx.fillRect(x - 6, y - 1.5, 12, 4); }
+  } else {
+    for (const o of [-4, 2]) { if (horiz) ctx.fillRect(Math.min(x0, x1), y0 + o, l, 3); else ctx.fillRect(x0 + o, Math.min(y0, y1), 3, l); }
+  }
+  tri(x1 + ux * 12, y1 + uy * 12, Math.atan2(uy, ux), 16);
+}
+
+// The cover: FIG. 1's title card with a live figure the player can lens. Runner 10 on brick 12,
+// facing a gap. Grounded, the lens carries 10 with 12; airborne, it doesn't.
+const COVER = { STEP: 48, BX: 236, BY: 352, BW: 330, BH: 62, HOME: 196, RS: 34 };
+const cover = { t: 0, k: 0, kT: 0, dir: -1, x: 0, y: 0, vy: 0, air: false, idle: 99, walk: 0, fall: -1, pieces: null };
+function coverReset() { Object.assign(cover, { t: 0, k: 0, kT: 0, dir: -1, vy: 0, air: false, idle: 99, walk: 0, fall: -1 }); cover.x = COVER.BX + COVER.HOME; cover.y = 0; }
+coverReset();
+function buildCover() {
+  cover.pieces = {
+    brick: cutPiece(COVER.BW, COVER.BH, PAPER.red, 0),
+    block: cutPiece(250, COVER.BH, PAPER.black, 2, { pitch: 14, sw: 5, border: 9 }),
+    pr: cutPiece(66, 150, PAPER.red, 0, { border: 6 }),
+    pg: cutPiece(66, 128, PAPER.green, 1, { border: 6 }),
+    pb: cutPiece(66, 108, PAPER.blue, 2, { border: 6 }),
+  };
+}
+const brickX = (kk = cover.k) => COVER.BX - kk * COVER.STEP;
+function coverLens(dir, player) {
+  cover.kT = clamp(Math.round(cover.kT) + dir, -2, 2); cover.dir = dir;
+  if (player) cover.idle = 0;
+}
+function coverHop() { if (!cover.air && cover.fall < 0) { cover.air = true; cover.vy = -430; sfx('jump'); } }
+// Runs on the sim clock (simStep) so the demo and the frame hook replay it exactly.
+function updateCover(dt) {
+  cover.t += dt; cover.idle += dt;
+  // the idle loop (6 s): carried, then not carried, then walk home
+  if (!DEMO && !RM && cover.idle > 5) {
+    const lt = cover.t % 6, prev = (cover.t - dt) % 6;
+    const at = s => prev < s && lt >= s;
+    if (at(0.8)) coverLens(-1);
+    if (at(2.6)) coverHop();
+    if (at(2.72)) coverLens(1);
+    if (at(4.3)) cover.walk = 1;
+  }
+  const bx0 = brickX();
+  const kb = cover.k;
+  cover.k += clamp(cover.kT - cover.k, -6 * dt, 6 * dt);
+  if (Math.round(cover.k) !== Math.round(kb) || (Math.abs(cover.k - cover.kT) < 1e-9 && Math.abs(kb - cover.kT) > 1e-9)) sfx('click');
+  const bx1 = brickX();
+  if (cover.fall >= 0) { cover.fall += dt; cover.y += 500 * dt; if (cover.fall > 0.7) { coverReset(); cover.idle = 99; } return; }
+  if (!cover.air) cover.x += bx1 - bx0;                         // carried
+  else {
+    cover.vy += 1500 * dt; cover.y += cover.vy * dt;
+    if (cover.y >= 0 && cover.vy > 0) {
+      const on = cover.x + COVER.RS > bx1 + 4 && cover.x < bx1 + COVER.BW - 4;
+      if (on) { cover.y = 0; cover.vy = 0; cover.air = false; sfx('land', 300); } else if (cover.y > 6) cover.fall = 0;
+    }
+  }
+  if (cover.walk && !cover.air) {
+    const home = bx1 + COVER.HOME, d = home - cover.x;
+    if (Math.abs(d) < 1) { cover.x = home; cover.walk = 0; } else cover.x += Math.sign(d) * Math.min(Math.abs(d), 110 * dt);
+  }
+  if (!cover.air && (cover.x + COVER.RS < bx1 + 2 || cover.x > bx1 + COVER.BW - 2)) cover.fall = 0;
+}
+function drawCover() {
+  const lc = PAPER.black, P = cover.pieces, S = VIEW.S;
+  const age = fx.cut && fx.cut.kind === 'title' ? fx.cut.age : 9;
+  setBase();
+  bigNumeral(String(best + 1), 34, 62, 420, age);
+  // the title: the only words on screen
+  ctx.fillStyle = lc; ctx.font = bs(84, 900); ctx.textAlign = 'right'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText('CHROMATIC DRIFT', 930, 128);
+  const put = (c, x, y) => { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(c, Math.round(VIEW.offX + x * S), Math.round(VIEW.offY + y * S)); setBase(); };
+  const u = [dropIn(0), dropIn(1), dropIn(2)];
+  // far side: a black block with the door fan standing on it
+  if (u[0]) {
+    const d = dropPx(u[0]);
+    put(P.block, 690, COVER.BY + d);
+    put(P.pr, 740, COVER.BY - 150 + d);
+    put(P.pg, 774, COVER.BY - 128 + d);
+    put(P.pb, 808, COVER.BY - 108 + d);
+    ctx.fillStyle = PAPER.white; ctx.fillRect(770, COVER.BY - 92 + d, 54, 92);
+    ctx.fillStyle = PAPER.black; ctx.beginPath(); ctx.arc(812, COVER.BY - 44 + d, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = PAPER.green; ctx.beginPath();                  // teeth down in the gap
+    for (let i = 0; i < 6; i++) { const x = 586 + i * 17; ctx.moveTo(x, 470 + d); ctx.lineTo(x + 8.5, 440 + d); ctx.lineTo(x + 17, 470 + d); }
+    ctx.fill();
+  }
+  const bx = brickX();
+  if (u[1]) put(P.brick, bx, COVER.BY + dropPx(u[1]));
+  // phantoms: brick 12' at the next stop both ways, 10' only while grounded
+  const turning = Math.abs(cover.kT - cover.k) > 1e-4;
+  let dir = turning ? Math.sign(cover.kT - cover.k) : cover.dir;
+  if (stopToward(dir, cover.k, -2, 2) === null) dir = -dir;
+  const strongK = stopToward(dir, cover.k, -2, 2), faintK = stopToward(-dir, cover.k, -2, 2);
+  const furn = dropIn(3);
+  if (furn) for (const [kk, al] of [[faintK, PHANTOM_FAINT], [strongK, 1]]) {
+    if (kk === null) continue;
+    ctx.globalAlpha = al * furn;
+    ctx.strokeStyle = PAPER.red; ctx.lineWidth = 3.5; ctx.setLineDash([10, 6]);
+    ctx.strokeRect(brickX(kk) + 1.75, COVER.BY + 1.75, COVER.BW - 3.5, COVER.BH - 3.5);
+    if (!cover.air && cover.fall < 0) {
+      ctx.strokeStyle = PAPER.black; ctx.setLineDash([6, 4]); ctx.lineWidth = 3.5;
+      ctx.strokeRect(cover.x + (brickX(kk) - bx) + 1.75, COVER.BY - COVER.RS + cover.y + 1.75, COVER.RS - 3.5, COVER.RS - 3.5);
+    }
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+  }
+  const rx = cover.x, ry = COVER.BY - COVER.RS + cover.y;
+  if (u[1]) drawRunner(false, rx, ry, COVER.RS, 1);
+  if (furn && cover.air && cover.y < -6) dimension(rx + COVER.RS + 10, ry + COVER.RS, COVER.BY, lc);
+  if (furn) {
+    const labels = [], a10 = [rx + COVER.RS + 1, ry + 6], a12 = [bx + 30, COVER.BY];
+    const s12 = strongK !== null ? [brickX(strongK) + (dir < 0 ? COVER.BW - 30 : 30), COVER.BY + COVER.BH] : null;
+    const s10 = strongK !== null && !cover.air ? [rx + (brickX(strongK) - bx) + (dir < 0 ? COVER.RS + 1 : -1), ry + 6] : null;
+    const away = (a, b) => a && b ? norm(a[0] - b[0], a[1] - b[1]) : null;
+    labels.push({ key: 'c10', txt: '10', x: a10[0], y: a10[1], away: away(a10, s10) || [1, -1], col: lc, size: 30 });
+    labels.push({ key: 'c12', txt: '12', x: a12[0], y: a12[1], away: [-1, 0.2], col: lc, size: 30 });
+    if (s10) labels.push({ key: "c10'", txt: "10′", x: s10[0], y: s10[1], away: away(s10, a10), col: lc, size: 30 });
+    if (s12) labels.push({ key: "c12'", txt: "12′", x: s12[0], y: s12[1], away: [dir < 0 ? 1 : -1, 0.6], col: lc, size: 30, dist: 18 });
+    placeLabels(labels, [[rx - 3, ry - 3, COVER.RS + 6, COVER.RS + 6], [bx, COVER.BY, COVER.BW, COVER.BH], [380, 40, 560, 100]], [8, 8, CW - 8, CH - 8]);
+    keyCaps([['Q', 'E'], 'LENS', ['SPACE'], 'BEGIN'], 930, 506, lc);
+  }
+}
+// Key hints as cut-paper caps; letters follow the player's keyboard layout (K()).
+function keyCaps(items, right, y, col) {
+  ctx.font = bs(20, 800); ctx.textBaseline = 'middle';
+  const parts = [];
+  for (const it of items) {
+    if (Array.isArray(it)) for (const kk of it) { const t = kk.length === 1 ? K('Key' + kk) : kk; parts.push({ cap: true, t, w: Math.max(26, ctx.measureText(t).width + 14) }); }
+    else parts.push({ cap: false, t: it, w: ctx.measureText(it).width + 22 });
+  }
+  let x = right - parts.reduce((s, q) => s + q.w + 6, 0);
+  for (const q of parts) {
+    if (q.cap) { ctx.fillStyle = PAPER.cream; ctx.fillRect(x, y - 14, q.w, 28); ctx.fillStyle = PAPER.black; ctx.textAlign = 'center'; ctx.fillText(q.t, x + q.w / 2, y + 1); }
+    else { ctx.fillStyle = col; ctx.textAlign = 'left'; ctx.fillText(q.t, x + 6, y + 1); }
+    x += q.w + 6;
+  }
+}
+function drawEnd() {
+  setBase();
+  bigNumeral('10', 26, 58, 412, 9);
+  ctx.fillStyle = labelCol(); ctx.textAlign = 'right'; ctx.textBaseline = 'alphabetic';
+  ctx.font = bs(96, 900); ctx.fillText('GRANTED', 930, 250);
+  const mm = Math.floor(runT / 60), ss = String(Math.floor(runT % 60)).padStart(2, '0');
+  ctx.font = bs(34, 800); ctx.fillText(`${mm}:${ss}  ·  ${deaths}`, 930, 310);
+  keyCaps([['R'], 'AGAIN'], 930, 506, labelCol());
+}
+
+// WebGL2 post pass, B's paper: a static seeded paper texture per piece, a soft layered drop shadow
+// 2 px down-right (a light box), a flat grade (saturation 1.0), no split and no lens (print has
+// none), and a 1-frame +-1 px gate jump on each cut.
+// The paper is static, so its noise (edge-roughness mask, fibre, mottling) is baked once into a
+// texture at the viewport's size; each frame only reads it.
+const glc = document.getElementById('gl');
+let G = null;
+const BAKE = `#version 300 es
+precision highp float;
+uniform vec2 uSize, uOrigin;
+uniform float uS;
+out vec4 o;
+${document.getElementById('glsl-lib').textContent}
+void main() {
+  vec2 px = vec2(gl_FragCoord.x, uSize.y - gl_FragCoord.y);
+  vec2 lp = (px - uOrigin) / uS;
+  // edge-roughness mask: where the frame is read from, in logical px (|d| < 0.8)
+  vec2 d = vec2(gradientNoise(lp * 0.13), gradientNoise(lp * 0.13 + vec2(41.3, 7.9))) * 0.55
+         + vec2(gradientNoise(lp * 0.71 + 7.7), gradientNoise(lp * 0.71 + 19.1)) * 0.22;
+  float fine = gradientNoise(lp * vec2(0.9, 0.16) + 3.1);      // long fibres
+  float mott = fbm(lp * 0.035 + 11.0, 3);                      // cloudy formation
+  o = vec4(d * 0.5 + 0.5, fine * 0.5 + 0.5, mott * 0.5 + 0.5);
+}`;
+const FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uFrame, uPaper;
+uniform vec2 uSize, uOrigin, uGate, uRed, uBlue;
+uniform float uS, uSeed;
+uniform vec3 uPal[7];
+uniform int uMode;
+out vec4 o;
+// Every piece is one flat paper colour, so the colour says which piece a pixel is, and the
+// palette order is the stacking order: field, numeral cream, green, red, blue, white, black.
+int cls(vec3 c) {
+  int b = 0; float bd = 1e9;
+  for (int i = 0; i < 7; i++) { vec3 d = c - uPal[i]; float e = dot(d, d); if (e < bd) { bd = e; b = i; } }
+  return b;
+}
+vec3 tap(vec2 px) { return texture(uFrame, px / uSize).rgb; }
+float depthAt(vec2 px) { return float(cls(tap(px))); }
+const vec2 TAPS[6] = vec2[6](vec2(0.0), vec2(1.0, 0.0), vec2(-0.5, 0.87), vec2(-0.5, -0.87), vec2(0.5, 0.87), vec2(0.5, -0.87));
+void main() {
+  vec2 px = vec2(gl_FragCoord.x, uSize.y - gl_FragCoord.y) - uGate;
+  if (uMode == 1) { o = vec4(tap(px), 1.0); return; }
+  vec2 d = (texture(uPaper, px / uSize).rg - 0.5) * 2.0;
+  vec2 sp = px + d * uS;
+  vec3 col = tap(sp);
+  int id = cls(col);
+  float dep = float(id);
+  // Each kind of paper reads its own patch of the sheet (seeded per FIG.), and the moving
+  // layers' patch rides with them. Mirrored repeat keeps the lookup seamless.
+  vec2 lp = id == 3 ? px - uRed : id == 4 ? px - uBlue : px;
+  vec2 pz = texture(uPaper, (lp + vec2(173.0, 91.0) * float(id) + vec2(311.0, 157.0) * uSeed) / uSize).ba * 2.0 - 1.0;
+  float f = pz.x * 0.6 + pz.y * 0.3;
+  col = col * (1.0 + 0.035 * f) + 0.01 * f;
+  float sh = 0.0, amb = 0.0;
+  vec2 off = vec2(2.0) * uS, off2 = vec2(3.5, 4.5) * uS;
+  for (int i = 0; i < 6; i++) {
+    float dd = depthAt(sp - off + TAPS[i] * 1.1 * uS) - dep;
+    sh += dd > 0.5 ? 0.85 + 0.05 * min(dd, 3.0) : 0.0;
+  }
+  for (int i = 0; i < 4; i++) amb += depthAt(sp - off2 + TAPS[i + 2] * 3.0 * uS) - dep > 0.5 ? 1.0 : 0.0;
+  col *= 1.0 - 0.30 * sh / 6.0 - 0.08 * amb / 4.0;
+  o = vec4(col, 1.0);
+}`;
+const VERT = `#version 300 es
+void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`;
+const hex3 = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
+function initGL() {
+  if (GL_OFF) return null;
+  let gl = null;
+  try { gl = glc.getContext('webgl2', { antialias: false, alpha: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: FRAMES, powerPreference: 'high-performance' }); } catch (e) { gl = null; }
+  if (!gl) return null;
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); return null; } return s; };
+  const program = (fsrc, names) => {
+    const vs = sh(gl.VERTEX_SHADER, VERT), fs = sh(gl.FRAGMENT_SHADER, fsrc);
+    if (!vs || !fs) return null;
+    const p = gl.createProgram(); gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { console.error(gl.getProgramInfoLog(p)); return null; }
+    const u = {}; for (const n of names) u[n] = gl.getUniformLocation(p, n);
+    return { p, u };
+  };
+  const post = program(FRAG, ['uFrame', 'uPaper', 'uSize', 'uOrigin', 'uGate', 'uRed', 'uBlue', 'uS', 'uSeed', 'uPal', 'uMode']);
+  const bake = program(BAKE, ['uSize', 'uOrigin', 'uS']);
+  if (!post || !bake) return null;
+  const mkTex = wrap => {
+    const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+    return t;
+  };
+  const tex = mkTex(gl.CLAMP_TO_EDGE), paper = mkTex(gl.MIRRORED_REPEAT), fbo = gl.createFramebuffer();
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  const vao = gl.createVertexArray();
+  document.documentElement.dataset.gl = 'on';
+  return { gl, post, bake, tex, paper, fbo, vao, ms: [], tw: 0, th: 0, pw: 0, ph: 0 };
+}
+function bakePaper() {
+  const { gl } = G, w = cv.width, h = cv.height;
+  gl.bindTexture(gl.TEXTURE_2D, G.paper);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, G.fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, G.paper, 0);
+  gl.viewport(0, 0, w, h);
+  gl.useProgram(G.bake.p); gl.bindVertexArray(G.vao);
+  gl.uniform2f(G.bake.u.uSize, w, h); gl.uniform2f(G.bake.u.uOrigin, VIEW.offX, VIEW.offY); gl.uniform1f(G.bake.u.uS, VIEW.S);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  G.pw = w; G.ph = h;
+}
+function renderGL() {
+  if (!G) return;
+  const { gl } = G, u = G.post.u, t0 = performance.now();
+  if (glc.width !== cv.width || glc.height !== cv.height) { glc.width = cv.width; glc.height = cv.height; }
+  if (!POST_OFF && (G.pw !== cv.width || G.ph !== cv.height)) bakePaper();
+  gl.viewport(0, 0, glc.width, glc.height);
+  gl.useProgram(G.post.p); gl.bindVertexArray(G.vao);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, G.paper);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, G.tex);
+  if (G.tw !== cv.width || G.th !== cv.height) { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, cv); G.tw = cv.width; G.th = cv.height; }
+  else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.uniform1i(u.uFrame, 0); gl.uniform1i(u.uPaper, 1);
+  gl.uniform2f(u.uSize, cv.width, cv.height);
+  gl.uniform2f(u.uOrigin, VIEW.offX, VIEW.offY);
+  const g = POST_OFF ? 0 : fx.gate * Math.max(1, Math.round(VIEW.S * 0.67));
+  gl.uniform2f(u.uGate, g, -g);
+  let red = [0, 0], blue = [0, 0];
+  if (state === 'title') red = [VIEW.offX + brickX() * VIEW.S, 0];
+  else if (L) { const [rx, ry] = offs(-1, k), [bx, by] = offs(1, k); red = [devX(rx), devY(ry)]; blue = [devX(bx), devY(by)]; }
+  gl.uniform2f(u.uRed, red[0], red[1]); gl.uniform2f(u.uBlue, blue[0], blue[1]);
+  gl.uniform1f(u.uS, VIEW.S);
+  gl.uniform1f(u.uSeed, state === 'title' ? 0 : li + 1);
+  gl.uniform3fv(u.uPal, [sheetInk(), PAPER.cream, PAPER.green, PAPER.red, PAPER.blue, PAPER.white, PAPER.black].flatMap(hex3));
+  gl.uniform1i(u.uMode, POST_OFF ? 1 : 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  fx.gate = 0;
+  if (G.measure) { gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, G.px || (G.px = new Uint8Array(4))); G.ms.push(performance.now() - t0); }
+}
+// Post-pass cost: upload + draw, synced with a 1-pixel readPixels so the GPU work is counted.
+window.__post = {
+  measure(n = 60) {
+    if (!G) return null;
+    G.ms = []; G.measure = true;
+    for (let i = 0; i < n; i++) renderGL();
+    G.measure = false;
+    const a = G.ms.slice().sort((x, y) => x - y);
+    return { n, median: a[a.length >> 1], p90: a[Math.floor(a.length * 0.9)], mean: a.reduce((s, v) => s + v, 0) / a.length, size: [cv.width, cv.height] };
+  },
+  get on() { return !!G; },
+};
+
+// Sound: office foley, WebAudio synthesis only, no music bed. Each cue fires on the frame of its visual.
+let ac = null, master = null, muted = false, noiseBuf = null;
+function initAudio() {
+  if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+  try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+  master = ac.createGain(); master.gain.value = muted ? 0 : 0.7; master.connect(ac.destination);
+  noiseBuf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
+  const nd = noiseBuf.getChannelData(0);
+  for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+  // room tone: a soft fan
+  const fan = ac.createBufferSource(); fan.buffer = noiseBuf; fan.loop = true;
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420;
+  const bp = ac.createBiquadFilter(); bp.type = 'peaking'; bp.frequency.value = 130; bp.gain.value = 6;
+  const g = ac.createGain(); g.gain.value = 0; g.gain.setTargetAtTime(0.03, ac.currentTime, 1.5);
+  fan.connect(lp); lp.connect(bp); bp.connect(g); g.connect(master); fan.start();
+}
+function updateAudio() {}
+function nz(dur, type, freq, q, vol, delay = 0, decay = dur) {
+  const t = ac.currentTime + delay, s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+  s.buffer = noiseBuf; s.playbackRate.value = 0.9 + Math.random() * 0.2;
+  f.type = type; f.frequency.value = freq; f.Q.value = q;
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + decay);
+  s.connect(f); f.connect(g); g.connect(master); s.start(t, Math.random()); s.stop(t + dur + 0.05);
+}
+function tone(f0, f1, dur, wave, vol, delay = 0) {
+  const t = ac.currentTime + delay, o = ac.createOscillator(), g = ac.createGain();
+  o.type = wave; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.004);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + dur + 0.02);
+}
+function sfx(type, v = 0) {
+  if (!ac || muted || ac.state !== 'running') return;
+  switch (type) {
+    case 'click':      // detent: noise burst + short resonant body, always the same pitch
+      nz(0.012, 'highpass', 2600, 0.7, 0.22); nz(0.06, 'bandpass', 1650, 22, 0.9, 0, 0.05); break;
+    case 'pin':        // the pin seats: lower and longer
+      nz(0.02, 'highpass', 1400, 0.7, 0.25); nz(0.18, 'bandpass', 560, 16, 1.4, 0, 0.16); nz(0.1, 'bandpass', 820, 14, 0.5, 0.028, 0.08); break;
+    case 'nib':        // nib scratch along the 0.4 s leader
+      for (let i = 0; i < 9; i++) nz(0.05, 'bandpass', 3600 + (i % 3) * 500, 3, 0.07 + 0.03 * (i % 2), i * 0.042, 0.04);
+      break;
+    case 'type':       // a typewriter strike
+      nz(0.006, 'highpass', 4200, 0.7, 0.35); nz(0.04, 'bandpass', 2300, 9, 0.7, 0, 0.03); tone(150, 85, 0.05, 'sine', 0.22); break;
+    case 'thump':      // felt stamp
+      nz(0.2, 'lowpass', 240, 0.8, 0.9, 0, 0.16); tone(82, 40, 0.2, 'sine', 0.5); break;
+    case 'thumpSoft':
+      nz(0.14, 'lowpass', 260, 0.8, 0.5, 0, 0.1); tone(90, 50, 0.12, 'sine', 0.28); break;
+    case 'jump': nz(0.03, 'bandpass', 1900, 1.5, 0.12); break;          // a paper flick
+    case 'land': nz(0.05, 'lowpass', 700, 0.7, clamp(v / 900, 0.08, 0.3)); break;
+    case 'splash': nz(0.3, 'bandpass', 900, 0.9, 0.25, 0, 0.28); break;
+    case 'resist': tone(120, 95, 0.05, 'sine', 0.2); nz(0.03, 'lowpass', 400, 0.7, 0.2); break;
+    case 'rip': nz(0.12, 'bandpass', 1100, 0.8, 0.35, 0, 0.1); break;
+  }
+}
+
+const IGNORED_ON_TITLE = ['ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight', 'Tab', 'Escape',
+  'KeyQ', 'KeyE', 'KeyM', 'KeyA', 'KeyD', 'ArrowLeft', 'ArrowRight', 'ArrowDown', 'KeyS'];
+function toTitle() { state = 'title'; keys.clear(); coverReset(); cut('title'); updateText(); }
+addEventListener('keydown', e => {
+  initAudio();
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+  if (e.repeat) return;
+  const m = /^Digit([0-9])$/.exec(e.code), n = m ? (m[1] === '0' ? 10 : +m[1]) : 0;
+  const pick = n && n <= LEVELS.length ? n - 1 : null;
+  if (state === 'title') {
+    if (e.code === 'KeyQ' || e.code === 'KeyE') coverLens(e.code === 'KeyQ' ? 1 : -1, true);
+    else if (e.code === 'KeyM') { muted = !muted; if (master) master.gain.value = muted ? 0 : 0.7; }
+    else if (!IGNORED_ON_TITLE.includes(e.code)) startGame(pick !== null ? pick : best);
+    return;
+  }
+  // Any key skips the death hold (real keys only, so the synthetic playtest is unaffected).
+  if (state === 'dead' && e.isTrusted && fx.dead && fx.dead.age >= FREEZE + CIRCLE_T) stT = 0;
+  keys.add(e.code);
+  if (JUMP_KEYS.includes(e.code)) jumpBuf = 0.12;
+  if (e.code === 'Escape') { toTitle(); return; }
+  if (e.code === 'KeyR') { if (state === 'end') startGame(0); else if (state === 'play') resetLevel(); }
+  if (e.code === 'KeyM') { muted = !muted; if (master) master.gain.value = muted ? 0 : 0.7; }
+  if (pick !== null) loadLevel(pick);
+});
+addEventListener('keyup', e => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+function onWheel(e) {
+  e.preventDefault(); initAudio();
+  // One lens step per wheel notch (deltaY ~100), trackpads accumulate; short cooldown
+  // so a single notch never counts twice.
+  wheelAcc += e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
+  if (Math.abs(wheelAcc) >= 40 && time - wheelT > 0.07) {
+    const s = Math.sign(wheelAcc); wheelAcc = 0; wheelT = time;
+    if (state === 'title') { coverLens(s, true); return; }
+    // horizontal: scroll down pushes red left; vertical: scroll down sinks red
+    kT = clamp(Math.round(kT) + (L && L.ay ? -s : s), -KMAX, KMAX);
+    lensUI.lastTouch = time; lensUI.dir = L && L.ay ? -s : s;
+  }
+}
+cv.addEventListener('wheel', onWheel, { passive: false });
+// Real wheels anywhere on the page (the WebGL canvas sits on top and ignores the pointer).
+addEventListener('wheel', e => { if (e.target !== cv) onWheel(e); }, { passive: false });
+addEventListener('pointerdown', () => { initAudio(); cv.focus(); if (state === 'title') startGame(best); });
+addEventListener('pointermove', e => {
+  const x = (e.clientX - VIEW.cssX) / VIEW.cssS - OX, y = (e.clientY - VIEW.cssY) / VIEW.cssS - OY;
+  hoverDial = state !== 'title' && Math.hypot(x - (W + 78), y - 92) < 46;
+});
+addEventListener('resize', () => { if (!FRAMES) layout(); });
+
+// ?demo: a scripted run keyed to sim steps, so it plays identically in real time and under ?__state=frames.
+const DEMO_T = s => Math.round(s * 120);
+const demo = { on: DEMO, prog: [], i: 0, step: 0, log: [] };
+function dLog(msg) { const e = [+(demo.step * DT).toFixed(3), msg]; demo.log.push(e); console.log(`[demo ${e[0].toFixed(2)}s] ${msg}`); }
+const Do = (msg, fn = () => {}) => () => { fn(); dLog(msg); return true; };
+const Wait = s => { let n = null; return () => { if (n === null) n = DEMO_T(s); return n-- <= 0; }; };
+const Until = (cond, msg) => () => { if (!cond()) return false; if (msg) dLog(msg); return true; };
+const press = c => CD.press(c), release = c => CD.release(c);
+demo.prog = [
+  Wait(0.45),
+  Do('cover: lens one stop while 10 stands on 12: 10 rides with 12 (10′ shown)', () => coverLens(-1)),
+  Wait(0.85),
+  Do('cover: 10 hops', () => coverHop()),
+  Wait(0.1),
+  Do('cover: lens back mid-air: 12 slides under, 10 stays put (no 10′, dimension line)', () => coverLens(1)),
+  Wait(1.6),
+  Do('Enter: stamp thump cuts to FIG. 1', () => startGame(0)),
+  Wait(0.6),
+  Do('hold Q (lens +1): strong phantoms 12′/10′ were already showing', () => press('KeyQ')),
+  Wait(0.12),
+  Do('release Q: lens snaps to k=1, runner carried left', () => release('KeyQ')),
+  Wait(0.55),
+  Do('hold Q again (lens +2)', () => press('KeyQ')),
+  Wait(0.12),
+  Do('release Q: lens snaps to k=2', () => release('KeyQ')),
+  Until(() => Math.abs(k - L.kd) < ALIGN_TOL),
+  Wait(0.5),
+  Do('walk right to the door', () => press('KeyD')),
+  Until(() => state === 'win'),
+  Do('release D', () => release('KeyD')),
+  Until(() => li === 1 && state === 'play'),
+  Wait(0.3),
+  Do('walk right to the edge', () => press('KeyD')),
+  Until(() => p.x + p.w / 2 >= (7 - k) * T - 2, 'at the edge: jump'),
+  Do('jump', () => press('Space')),
+  Wait(0.08),
+  Do('mid-air: hold Q (lens toward +4): no 10′, dimension line to red', () => press('KeyQ')),
+  Wait(4 / 6),
+  Do('release Q', () => release('KeyQ')),
+  Until(() => p.grounded),
+  Do('release jump, keep walking right', () => release('Space')),
+  Wait(0.3),
+  Do('stop', () => release('KeyD')),
+  Wait(0.6),
+  Do('standing: hold E (lens back toward +1): 10′ already showed the carry into the spikes', () => press('KeyE')),
+  Until(() => state === 'dead'),
+  Do('release E', () => release('KeyE')),
+  Until(() => state === 'play'),
+  Wait(1.0),
+  Do('script ends'),
+];
+// Sim events are logged as they happen, independent of where the script is waiting.
+const seen = { state: null, li: -1, grounded: true, aligned: false };
+function demoWatch() {
+  const al = !!L && Math.abs(k - L.kd) < ALIGN_TOL;
+  if (L && li !== seen.li) dLog(`level ${li + 1} ${L.name} loaded`);
+  if (state !== seen.state) dLog(`state -> ${state}${state === 'dead' ? ' (hold 6 frames, circle, ANTICIPATED)' : ''}`);
+  if (al && !seen.aligned) dLog(`aligned at k=${L.kd}: door turns white, leader + "18"`);
+  if (p && state === 'play' && p.grounded !== seen.grounded && seen.li === li) dLog(p.grounded ? `landed (k=${k.toFixed(2)})` : 'airborne');
+  Object.assign(seen, { state, li: L ? li : -1, grounded: p ? p.grounded : true, aligned: al });
+}
+function demoTick() {
+  if (!demo.on) return;
+  demoWatch();
+  while (demo.i < demo.prog.length && demo.prog[demo.i]()) demo.i++;
+  demo.step++;
+}
+function simStep() {
+  demoTick();
+  if (state === 'title') { time += DT; updateCover(DT); return; }
+  update(DT);
+  const q = keys.has('KeyQ'), e = keys.has('KeyE');
+  if (q !== e && state === 'play') { lensUI.lastTouch = time; lensUI.dir = q ? 1 : -1; }
+}
+
+window.CD = {
+  get k() { return k; }, get kT() { return kT; }, get p() { return p; }, get state() { return state; },
+  get li() { return li; }, get deaths() { return deaths; }, get axis() { return L.axis; },
+  get names() { return LEVELS.map(l => l.name); },
+  press(c) { keys.add(c); if (JUMP_KEYS.includes(c)) jumpBuf = 0.12; }, release(c) { keys.delete(c); },
+  lens(v) { kT = v; }, step(n = 1) { for (let i = 0; i < n; i++) update(DT); }, load: loadLevel,
+  pause(v = true) { paused = v; keys.clear(); },
+  get demoLog() { return demo.log; },
+  get cover() { return { k: cover.k, x: cover.x, y: cover.y, air: cover.air }; },
+};
+
+layout();
+updateText();
+G = initGL();
+// Big Shoulders Display measures differently from the Impact fallback: size the huge numerals from the real glyph.
+const fontReady = (document.fonts && document.fonts.load ? Promise.all([document.fonts.load(bs(100, 900), '0123456789'), document.fonts.load(bs(100, 800), 'FIG.')]) : Promise.resolve())
+  .catch(() => {}).then(() => {
+    ctx.font = bs(100, 900); ctx.textBaseline = 'alphabetic'; const m = ctx.measureText('1');
+    if (m.actualBoundingBoxAscent > 10) numRatio = m.actualBoundingBoxAscent / 100;
+  });
+
+if (FRAMES) {
+  // Nothing advances on its own: no rAF loop. The sim only moves inside step(), and the
+  // post pass renders exactly once per step, on virtual time.
+  paused = true;
+  let vt = 0, steps = 0;
+  window.__frames = {
+    ready: fontReady.then(() => { render(); renderGL(); }),
+    step(ms) {
+      vt += ms;
+      const target = Math.floor(vt * 120 / 1000 + 1e-6);
+      while (steps < target) { simStep(); steps++; }
+      updateFx(ms / 1000); render(); renderGL();
+    },
+    time() { return vt; },
+  };
+} else {
+  let last = performance.now(), acc = 0;
+  const frame = now => {
+    const rdt = Math.min(0.1, (now - last) / 1000);
+    acc += rdt; last = now;
+    if (!paused) while (acc >= DT) { simStep(); acc -= DT; } else acc = 0;
+    updateFx(rdt); render(); renderGL(); updateAudio();
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+// ?test runs the automated playtest (playtest.js) against every level.
+if (TEST_MODE) {
+  const s = document.createElement('script'); s.src = '../playtest.js'; document.body.appendChild(s);
+}
+</script>
+</body>
+</html>
