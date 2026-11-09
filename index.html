@@ -373,6 +373,8 @@ const CONT = new Map();
 const defAt = i => i < LEVELS.length ? LEVELS[i] : CONT.get(i);
 const kmaxOf = (d = L) => (d && d.kmax) || KMAX;
 let li = 0, L = null, k = 0, kT = 0, p = null, state = 'title', stT = 0, deaths = 0, time = 0, runT = 0;
+// The Q/E press in progress: the whole step it started from and its direction (see the keyup handler).
+let lensTap = null;
 let jumpBuf = 0, resistShake = 0, lastResist = -1, wheelAcc = 0, wheelT = -1, paused = false, deathAt = null;
 let wasAligned = false;
 // Pixel offset of a layer: s = -1 red, 0 green, +1 blue.
@@ -404,7 +406,7 @@ function loadLevel(i) {
   resetLevel(); updateText(); onLoadLevel();
 }
 function resetLevel() {
-  k = kT = L.k0;
+  k = kT = L.k0; lensTap = null;
   p = { w: 20, h: 26, vx: 0, vy: 0, face: 1, grounded: true, coyote: 0, wet: null };
   p.x = L.spawn.x * T + (T - p.w) / 2;
   p.y = (L.spawn.y + 1) * T - p.h;
@@ -2962,12 +2964,25 @@ addEventListener('keydown', e => {
   if (state === 'dead' && e.isTrusted && fx.dead && fx.dead.age >= FREEZE + CIRCLE_T) stT = 0;
   if (fx.cut && fx.cut.kind === 'sheet' && fx.cut.go < 0) fx.cut.go = fx.cut.age;   // play begins: the numeral retracts
   keys.add(e.code);
+  if ((e.code === 'KeyQ' || e.code === 'KeyE') && state === 'play') {
+    lensTap = { code: e.code, from: Math.round(kT), dir: e.code === 'KeyQ' ? 1 : -1 };
+  }
   if (JUMP_KEYS.includes(e.code)) jumpBuf = 0.12;
   if (e.code === 'KeyR' && state === 'play') resetLevel();
   if (pick !== null) jumpTo(pick, loadLevel);
 });
-addEventListener('keyup', e => keys.delete(e.code));
-addEventListener('blur', () => keys.clear());
+addEventListener('keyup', e => {
+  keys.delete(e.code);
+  const tap = lensTap;
+  if (!tap || tap.code !== e.code) return;
+  lensTap = null;
+  // Holding Q/E turns the lens and release snaps it to the nearest step, so a tap shorter than
+  // half a step (~85 ms) would snap back to where it began. A tap always turns one step.
+  if (state === 'play' && !keys.has('KeyQ') && !keys.has('KeyE') && Math.round(kT) === tap.from) {
+    kT = clamp(tap.from + tap.dir, -kmaxOf(), kmaxOf());
+  }
+});
+addEventListener('blur', () => { keys.clear(); lensTap = null; });
 function onWheel(e) {
   e.preventDefault(); initAudio(e);
   if (state === 'brief' || state === 'end') return;
